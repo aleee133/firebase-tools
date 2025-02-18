@@ -4,10 +4,11 @@ import {
   mirrorFieldTo,
   randomDigits,
   isValidPhoneNumber,
+  DeepPartial,
 } from "./utils";
 import { MakeRequired } from "./utils";
 import { AuthCloudFunction } from "./cloudFunctions";
-import { assert } from "./errors";
+import { assert, BadRequestError } from "./errors";
 import { MfaEnrollments, Schemas } from "./types";
 
 export const PROVIDER_PASSWORD = "password";
@@ -25,11 +26,10 @@ export abstract class ProjectState {
   private localIdForPhoneNumber: Map<string, string> = new Map();
   private localIdsForProviderEmail: Map<string, Set<string>> = new Map();
   private userIdForProviderRawId: Map<string, Map<string, string>> = new Map();
-  private refreshTokens: Map<string, RefreshTokenRecord> = new Map();
-  private refreshTokensForLocalId: Map<string, Set<string>> = new Map();
   private oobs: Map<string, OobRecord> = new Map();
   private verificationCodes: Map<string, PhoneVerificationRecord> = new Map();
   private temporaryProofs: Map<string, TemporaryProofRecord> = new Map();
+  private pendingLocalIds: Set<string> = new Set();
 
   constructor(public readonly projectId: string) {}
 
@@ -41,9 +41,9 @@ export abstract class ProjectState {
 
   abstract get oneAccountPerEmail(): boolean;
 
-  abstract get authCloudFunction(): AuthCloudFunction;
+  abstract get enableImprovedEmailPrivacy(): boolean;
 
-  abstract get usageMode(): UsageMode;
+  abstract get authCloudFunction(): AuthCloudFunction;
 
   abstract get allowPasswordSignup(): boolean;
 
@@ -55,14 +55,22 @@ export abstract class ProjectState {
 
   abstract get enableEmailLinkSignin(): boolean;
 
-  createUser(props: Omit<UserInfo, "localId" | "createdAt" | "lastRefreshAt">): UserInfo {
+  abstract shouldForwardCredentialToBlockingFunction(
+    type: "accessToken" | "idToken" | "refreshToken",
+  ): boolean;
+
+  abstract getBlockingFunctionUri(event: BlockingFunctionEvents): string | undefined;
+
+  generateLocalId(): string {
     for (let i = 0; i < 10; i++) {
       // Try this for 10 times to prevent ID collision (since our RNG is
       // Math.random() which isn't really that great).
       const localId = randomId(28);
-      const user = this.createUserWithLocalId(localId, props);
-      if (user) {
-        return user;
+      if (!this.users.has(localId) && !this.pendingLocalIds.has(localId)) {
+        // Create a pending localId until user is created. This creates a memory
+        // leak if a blocking functions throws and the localId is never used.
+        this.pendingLocalIds.add(localId);
+        return localId;
       }
     }
     // If we get 10 collisions in a row, there must be something very wrong.
@@ -71,17 +79,15 @@ export abstract class ProjectState {
 
   createUserWithLocalId(
     localId: string,
-    props: Omit<UserInfo, "localId" | "lastRefreshAt">
+    props: Omit<UserInfo, "localId" | "lastRefreshAt">,
   ): UserInfo | undefined {
     if (this.users.has(localId)) {
       return undefined;
     }
-    const timestamp = new Date();
     this.users.set(localId, {
       localId,
-      createdAt: props.createdAt || timestamp.getTime().toString(),
-      lastLoginAt: timestamp.getTime().toString(),
     });
+    this.pendingLocalIds.delete(localId);
 
     const user = this.updateUserByLocalId(localId, props, {
       upsertProviders: props.providerUserInfo,
@@ -98,7 +104,7 @@ export abstract class ProjectState {
    */
   overwriteUserWithLocalId(
     localId: string,
-    props: Omit<UserInfo, "localId" | "lastRefreshAt">
+    props: Omit<UserInfo, "localId" | "lastRefreshAt">,
   ): UserInfo {
     const userInfoBefore = this.users.get(localId);
     if (userInfoBefore) {
@@ -121,15 +127,6 @@ export abstract class ProjectState {
   deleteUser(user: UserInfo): void {
     this.users.delete(user.localId);
     this.removeUserFromIndex(user);
-
-    const refreshTokens = this.refreshTokensForLocalId.get(user.localId);
-    if (refreshTokens) {
-      this.refreshTokensForLocalId.delete(user.localId);
-      for (const refreshToken of refreshTokens) {
-        this.refreshTokens.delete(refreshToken);
-      }
-    }
-
     this.authCloudFunction.dispatch("delete", user);
   }
 
@@ -139,7 +136,7 @@ export abstract class ProjectState {
     options: {
       upsertProviders?: ProviderUserInfo[];
       deleteProviders?: string[];
-    } = {}
+    } = {},
   ): UserInfo {
     const upsertProviders = options.upsertProviders ?? [];
     const deleteProviders = options.deleteProviders ?? [];
@@ -221,16 +218,16 @@ export abstract class ProjectState {
     for (const enrollment of enrollments) {
       assert(
         enrollment.phoneInfo && isValidPhoneNumber(enrollment.phoneInfo),
-        "INVALID_MFA_PHONE_NUMBER : Invalid format."
+        "INVALID_MFA_PHONE_NUMBER : Invalid format.",
       );
       assert(
         enrollment.mfaEnrollmentId,
-        "INVALID_MFA_ENROLLMENT_ID : mfaEnrollmentId must be defined."
+        "INVALID_MFA_ENROLLMENT_ID : mfaEnrollmentId must be defined.",
       );
       assert(!enrollmentIds.has(enrollment.mfaEnrollmentId), "DUPLICATE_MFA_ENROLLMENT_ID");
       assert(
         !phoneNumbers.has(enrollment.phoneInfo),
-        "INTERNAL_ERROR : MFA Enrollment Phone Numbers must be unique."
+        "INTERNAL_ERROR : MFA Enrollment Phone Numbers must be unique.",
       );
       phoneNumbers.add(enrollment.phoneInfo);
       enrollmentIds.add(enrollment.mfaEnrollmentId);
@@ -241,7 +238,7 @@ export abstract class ProjectState {
   private updateUserProviderInfo(
     user: UserInfo,
     upsertProviders: ProviderUserInfo[],
-    deleteProviders: string[]
+    deleteProviders: string[],
   ): UserInfo {
     const oldProviderEmails = getProviderEmailsForUser(user);
 
@@ -269,7 +266,7 @@ export abstract class ProjectState {
         users.set(upsert.rawId, user.localId);
 
         const index = user.providerUserInfo.findIndex(
-          (info) => info.providerId === upsert.providerId
+          (info) => info.providerId === upsert.providerId,
         );
         if (index < 0) {
           user.providerUserInfo.push(upsert);
@@ -373,7 +370,7 @@ export abstract class ProjectState {
       const info = user.providerUserInfo?.find((info) => info.providerId === provider);
       if (!info) {
         throw new Error(
-          `Internal assertion error: User ${localId} does not have providerInfo ${provider}.`
+          `Internal assertion error: User ${localId} does not have providerInfo ${provider}.`,
         );
       }
       infos.push(info);
@@ -394,42 +391,38 @@ export abstract class ProjectState {
     }: {
       extraClaims?: Record<string, unknown>;
       secondFactor?: SecondFactorRecord;
-    } = {}
+    } = {},
   ): string {
     const localId = userInfo.localId;
-    const refreshToken = randomBase64UrlStr(204);
-    this.refreshTokens.set(refreshToken, {
+    const refreshTokenRecord = {
+      _AuthEmulatorRefreshToken: "DO NOT MODIFY",
       localId,
       provider,
       extraClaims,
+      projectId: this.projectId,
       secondFactor,
       tenantId: userInfo.tenantId,
-    });
-    let refreshTokens = this.refreshTokensForLocalId.get(localId);
-    if (!refreshTokens) {
-      refreshTokens = new Set();
-      this.refreshTokensForLocalId.set(localId, refreshTokens);
-    }
-    refreshTokens.add(refreshToken);
+    };
+    const refreshToken = encodeRefreshToken(refreshTokenRecord);
     return refreshToken;
   }
 
-  validateRefreshToken(
-    refreshToken: string
-  ):
-    | {
-        user: UserInfo;
-        provider: string;
-        extraClaims: Record<string, unknown>;
-        secondFactor?: SecondFactorRecord;
-      }
-    | undefined {
-    const record = this.refreshTokens.get(refreshToken);
-    if (!record) {
-      return undefined;
+  validateRefreshToken(refreshToken: string): {
+    user: UserInfo;
+    provider: string;
+    extraClaims: Record<string, unknown>;
+    secondFactor?: SecondFactorRecord;
+  } {
+    const record = decodeRefreshToken(refreshToken);
+    assert(record.projectId === this.projectId, "INVALID_REFRESH_TOKEN");
+    if (this instanceof TenantProjectState) {
+      // Shouldn't ever reach this assertion, but adding for completeness
+      assert(record.tenantId === this.tenantId, "TENANT_ID_MISMATCH");
     }
+    const user = this.getUserByLocalId(record.localId);
+    assert(user, "INVALID_REFRESH_TOKEN");
     return {
-      user: this.getUserByLocalIdAssertingExists(record.localId),
+      user,
       provider: record.provider,
       extraClaims: record.extraClaims,
       secondFactor: record.secondFactor,
@@ -438,14 +431,16 @@ export abstract class ProjectState {
 
   createOob(
     email: string,
+    newEmail: string | undefined,
     requestType: OobRequestType,
-    generateLink: (oobCode: string) => string
+    generateLink: (oobCode: string) => string,
   ): OobRecord {
     const oobCode = randomBase64UrlStr(54);
     const oobLink = generateLink(oobCode);
 
     const oob: OobRecord = {
       email,
+      newEmail,
       requestType,
       oobCode,
       oobLink,
@@ -495,8 +490,6 @@ export abstract class ProjectState {
     this.localIdForPhoneNumber.clear();
     this.localIdsForProviderEmail.clear();
     this.userIdForProviderRawId.clear();
-    this.refreshTokens.clear();
-    this.refreshTokensForLocalId.clear();
 
     // We do not clear OOBs / phone verification codes since some of those may
     // still be valid (e.g. email link / phone sign-in may still create a new
@@ -516,7 +509,7 @@ export abstract class ProjectState {
       order: "ASC" | "DESC";
       sortByField: "localId";
       startToken?: string;
-    }
+    },
   ): UserInfo[] {
     const users = [];
     for (const user of this.users.values()) {
@@ -550,7 +543,7 @@ export abstract class ProjectState {
 
   validateTemporaryProof(
     temporaryProof: string,
-    phoneNumber: string
+    phoneNumber: string,
   ): TemporaryProofRecord | undefined {
     const record = this.temporaryProofs.get(temporaryProof);
     if (!record || record.phoneNumber !== phoneNumber) {
@@ -584,10 +577,15 @@ export abstract class ProjectState {
 }
 
 export class AgentProjectState extends ProjectState {
-  private _oneAccountPerEmail = true;
-  private _usageMode = UsageMode.DEFAULT;
   private tenantProjectForTenantId: Map<string, TenantProjectState> = new Map();
   private readonly _authCloudFunction = new AuthCloudFunction(this.projectId);
+  private _config: Config = {
+    signIn: { allowDuplicateEmails: false },
+    blockingFunctions: {},
+    emailPrivacyConfig: {
+      enableImprovedEmailPrivacy: false,
+    },
+  };
 
   constructor(projectId: string) {
     super(projectId);
@@ -598,19 +596,19 @@ export class AgentProjectState extends ProjectState {
   }
 
   get oneAccountPerEmail() {
-    return this._oneAccountPerEmail;
+    return !this._config.signIn.allowDuplicateEmails;
   }
 
   set oneAccountPerEmail(oneAccountPerEmail: boolean) {
-    this._oneAccountPerEmail = oneAccountPerEmail;
+    this._config.signIn.allowDuplicateEmails = !oneAccountPerEmail;
   }
 
-  get usageMode() {
-    return this._usageMode;
+  get enableImprovedEmailPrivacy() {
+    return !!this._config.emailPrivacyConfig.enableImprovedEmailPrivacy;
   }
 
-  set usageMode(usageMode: UsageMode) {
-    this._usageMode = usageMode;
+  set enableImprovedEmailPrivacy(improveEmailPrivacy: boolean) {
+    this._config.emailPrivacyConfig.enableImprovedEmailPrivacy = improveEmailPrivacy;
   }
 
   get allowPasswordSignup() {
@@ -631,6 +629,56 @@ export class AgentProjectState extends ProjectState {
 
   get enableEmailLinkSignin() {
     return true;
+  }
+
+  get config() {
+    return this._config;
+  }
+
+  get blockingFunctionsConfig() {
+    return this._config.blockingFunctions;
+  }
+
+  set blockingFunctionsConfig(blockingFunctions: BlockingFunctionsConfig) {
+    this._config.blockingFunctions = blockingFunctions;
+  }
+
+  shouldForwardCredentialToBlockingFunction(
+    type: "accessToken" | "idToken" | "refreshToken",
+  ): boolean {
+    switch (type) {
+      case "accessToken":
+        return this._config.blockingFunctions.forwardInboundCredentials?.accessToken ?? false;
+      case "idToken":
+        return this._config.blockingFunctions.forwardInboundCredentials?.idToken ?? false;
+      case "refreshToken":
+        return this._config.blockingFunctions.forwardInboundCredentials?.refreshToken ?? false;
+    }
+  }
+
+  getBlockingFunctionUri(event: BlockingFunctionEvents): string | undefined {
+    const triggers = this.blockingFunctionsConfig.triggers;
+    if (triggers) {
+      return Object.prototype.hasOwnProperty.call(triggers, event)
+        ? triggers![event].functionUri
+        : undefined;
+    }
+    return undefined;
+  }
+
+  updateConfig(
+    update: Schemas["GoogleCloudIdentitytoolkitAdminV2Config"],
+    updateMask: string | undefined,
+  ): Config {
+    // Empty masks indicate a full update.
+    if (!updateMask) {
+      this.oneAccountPerEmail = !update.signIn?.allowDuplicateEmails ?? true;
+      this.blockingFunctionsConfig = update.blockingFunctions ?? {};
+      this.enableImprovedEmailPrivacy =
+        update.emailPrivacyConfig?.enableImprovedEmailPrivacy ?? false;
+      return this.config;
+    }
+    return applyMask(updateMask, this.config, update);
   }
 
   getTenantProject(tenantId: string): TenantProjectState {
@@ -693,7 +741,7 @@ export class AgentProjectState extends ProjectState {
     tenant.tenantId = tenantId;
     this.tenantProjectForTenantId.set(
       tenantId,
-      new TenantProjectState(this.projectId, tenantId, tenant, this)
+      new TenantProjectState(this.projectId, tenantId, tenant, this),
     );
     return tenant;
   }
@@ -708,7 +756,7 @@ export class TenantProjectState extends ProjectState {
     projectId: string,
     readonly tenantId: string,
     private _tenantConfig: Tenant,
-    private readonly parentProject: AgentProjectState
+    private readonly parentProject: AgentProjectState,
   ) {
     super(projectId);
   }
@@ -717,12 +765,12 @@ export class TenantProjectState extends ProjectState {
     return this.parentProject.oneAccountPerEmail;
   }
 
-  get authCloudFunction() {
-    return this.parentProject.authCloudFunction;
+  get enableImprovedEmailPrivacy() {
+    return this.parentProject.enableImprovedEmailPrivacy;
   }
 
-  get usageMode() {
-    return this.parentProject.usageMode;
+  get authCloudFunction() {
+    return this.parentProject.authCloudFunction;
   }
 
   get tenantConfig() {
@@ -749,13 +797,23 @@ export class TenantProjectState extends ProjectState {
     return this._tenantConfig.enableEmailLinkSignin;
   }
 
+  shouldForwardCredentialToBlockingFunction(
+    type: "accessToken" | "idToken" | "refreshToken",
+  ): boolean {
+    return this.parentProject.shouldForwardCredentialToBlockingFunction(type);
+  }
+
+  getBlockingFunctionUri(event: BlockingFunctionEvents): string | undefined {
+    return this.parentProject.getBlockingFunctionUri(event);
+  }
+
   delete(): void {
     this.parentProject.deleteTenant(this.tenantId);
   }
 
   updateTenant(
     update: Schemas["GoogleCloudIdentitytoolkitAdminV2Tenant"],
-    updateMask: string | undefined
+    updateMask: string | undefined,
   ): Tenant {
     // Empty masks indicate a full update
     if (!updateMask) {
@@ -781,52 +839,7 @@ export class TenantProjectState extends ProjectState {
       return this.tenantConfig;
     }
 
-    const paths = updateMask.split(",");
-    for (const path of paths) {
-      const fields = path.split(".");
-      // Using `any` here to recurse over Tenant config objects
-      let updateField: any = update;
-      let existingField: any = this._tenantConfig;
-      let field;
-      for (let i = 0; i < fields.length - 1; i++) {
-        field = fields[i];
-
-        // Doesn't exist on update
-        if (updateField[field] == null) {
-          console.warn(`Unable to find field '${field}' in update '${updateField}`);
-          break;
-        }
-
-        // Field on existing is an array or is a primitive (i.e. cannot index
-        // any further)
-        if (
-          Array.isArray(updateField[field]) ||
-          Object(updateField[field]) !== updateField[field]
-        ) {
-          console.warn(`Field '${field}' is singular and cannot have sub-fields`);
-          break;
-        }
-
-        // Non-standard behavior, this creates new fields regardless of if the
-        // final field is set. Typical behavior would not modify the config
-        // payload if the final field is not successfully set.
-        if (!existingField[field]) {
-          existingField[field] = {};
-        }
-
-        updateField = updateField[field];
-        existingField = existingField[field];
-      }
-      // Reassign final field if possible
-      field = fields[fields.length - 1];
-      if (updateField[field] == null) {
-        console.warn(`Unable to find field '${field}' in update '${JSON.stringify(updateField)}`);
-        continue;
-      }
-      existingField[field] = updateField[field];
-    }
-
-    return this.tenantConfig;
+    return applyMask(updateMask, this.tenantConfig, update);
   }
 }
 
@@ -853,10 +866,32 @@ export type Tenant = Omit<
   "testPhoneNumbers" | "mfaConfig"
 > & { tenantId: string; mfaConfig: MfaConfig };
 
-interface RefreshTokenRecord {
+export type SignInConfig = MakeRequired<
+  Schemas["GoogleCloudIdentitytoolkitAdminV2SignInConfig"],
+  "allowDuplicateEmails"
+>;
+
+export type BlockingFunctionsConfig =
+  Schemas["GoogleCloudIdentitytoolkitAdminV2BlockingFunctionsConfig"];
+
+export type EmailPrivacyConfig = Schemas["GoogleCloudIdentitytoolkitAdminV2EmailPrivacyConfig"];
+
+// Serves as a substitute for Schemas["GoogleCloudIdentitytoolkitAdminV2Config"],
+// i.e. the configuration object for top-level AgentProjectStates. Emulator
+// fixes certain configurations for ease of use / testing, so as non-standard
+// behavior, Config only stores the configurable fields.
+export type Config = {
+  signIn: SignInConfig;
+  blockingFunctions: BlockingFunctionsConfig;
+  emailPrivacyConfig: EmailPrivacyConfig;
+};
+
+export interface RefreshTokenRecord {
+  _AuthEmulatorRefreshToken: string;
   localId: string;
   provider: string;
   extraClaims: Record<string, unknown>;
+  projectId: string;
   secondFactor?: SecondFactorRecord;
   tenantId?: string;
 }
@@ -872,6 +907,7 @@ export type OobRequestType = NonNullable<
 
 export interface OobRecord {
   email: string;
+  newEmail?: string;
   oobLink: string;
   oobCode: string;
   requestType: OobRequestType;
@@ -883,12 +919,33 @@ export interface PhoneVerificationRecord {
   sessionInfo: string;
 }
 
+export enum BlockingFunctionEvents {
+  BEFORE_CREATE = "beforeCreate",
+  BEFORE_SIGN_IN = "beforeSignIn",
+}
+
 interface TemporaryProofRecord {
   phoneNumber: string;
   temporaryProof: string;
   temporaryProofExpiresIn: string;
   // Temporary proofs in emulator never expire to make interactive debugging
   // a bit easier. Therefore, there's no need to record createdAt timestamps.
+}
+
+export function encodeRefreshToken(refreshTokenRecord: RefreshTokenRecord): string {
+  return Buffer.from(JSON.stringify(refreshTokenRecord), "utf8").toString("base64");
+}
+
+export function decodeRefreshToken(refreshTokenString: string): RefreshTokenRecord {
+  let refreshTokenRecord: RefreshTokenRecord;
+  try {
+    const json = Buffer.from(refreshTokenString, "base64").toString("utf8");
+    refreshTokenRecord = JSON.parse(json) as RefreshTokenRecord;
+  } catch {
+    throw new BadRequestError("INVALID_REFRESH_TOKEN");
+  }
+  assert(refreshTokenRecord._AuthEmulatorRefreshToken, "INVALID_REFRESH_TOKEN");
+  return refreshTokenRecord;
 }
 
 function getProviderEmailsForUser(user: UserInfo): Set<string> {
@@ -901,7 +958,57 @@ function getProviderEmailsForUser(user: UserInfo): Set<string> {
   return emails;
 }
 
-export enum UsageMode {
-  DEFAULT = "DEFAULT",
-  PASSTHROUGH = "PASSTHROUGH",
+/**
+ * Updates fields based on specified update mask. Note that this is a no-op if
+ * the update mask is empty.
+ *
+ * @param updateMask a comma separated list of fully qualified names of fields
+ * @param dest the destination to apply updates to
+ * @param update the updates to apply
+ * @returns the updated destination object
+ */
+function applyMask<T>(updateMask: string, dest: T, update: DeepPartial<T>): T {
+  const paths = updateMask.split(",");
+  for (const path of paths) {
+    const fields = path.split(".");
+    // Using `any` here to recurse over destination objects
+    let updateField: any = update;
+    let existingField: any = dest;
+    let field;
+    for (let i = 0; i < fields.length - 1; i++) {
+      field = fields[i];
+
+      // Doesn't exist on update
+      if (updateField[field] == null) {
+        console.warn(`Unable to find field '${field}' in update '${updateField}`);
+        break;
+      }
+
+      // Field on existing is an array or is a primitive (i.e. cannot index
+      // any further)
+      if (Array.isArray(updateField[field]) || Object(updateField[field]) !== updateField[field]) {
+        console.warn(`Field '${field}' is singular and cannot have sub-fields`);
+        break;
+      }
+
+      // Non-standard behavior, this creates new fields regardless of if the
+      // final field is set. Typical behavior would not modify the config
+      // payload if the final field is not successfully set.
+      if (!existingField[field]) {
+        existingField[field] = {};
+      }
+
+      updateField = updateField[field];
+      existingField = existingField[field];
+    }
+    // Reassign final field if possible
+    field = fields[fields.length - 1];
+    if (updateField[field] == null) {
+      console.warn(`Unable to find field '${field}' in update '${JSON.stringify(updateField)}`);
+      continue;
+    }
+    existingField[field] = updateField[field];
+  }
+
+  return dest;
 }

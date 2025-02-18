@@ -1,7 +1,4 @@
-import * as fs from "fs";
-import * as path from "path";
-
-import * as clc from "cli-color";
+import * as clc from "colorette";
 
 import * as env from "./env";
 import * as functionsConfig from "../functionsConfig";
@@ -47,7 +44,7 @@ export function getProjectInfos(options: {
       if (Object.keys(result).includes(projectId)) {
         logWarning(
           `Multiple aliases found for ${clc.bold(projectId)}. ` +
-            `Preferring alias (${clc.bold(result[projectId])}) over (${clc.bold(alias)}).`
+            `Preferring alias (${clc.bold(result[projectId])}) over (${clc.bold(alias)}).`,
         );
         continue;
       }
@@ -84,7 +81,7 @@ export async function hydrateConfigs(pInfos: ProjectConfigInfo[]): Promise<void>
       })
       .catch((err) => {
         logger.debug(
-          `Failed to fetch runtime config for project ${info.projectId}: ${err.message}`
+          `Failed to fetch runtime config for project ${info.projectId}: ${err.message}`,
         );
       });
   });
@@ -107,7 +104,7 @@ export function convertKey(configKey: string, prefix: string): string {
   let envKey = baseKey;
   try {
     env.validateKey(envKey);
-  } catch (err) {
+  } catch (err: any) {
     if (err instanceof env.KeyValidationError) {
       envKey = prefix + envKey;
       env.validateKey(envKey);
@@ -127,7 +124,7 @@ export function configToEnv(configs: Record<string, unknown>, prefix: string): C
     try {
       const envKey = convertKey(configKey, prefix);
       success.push({ origKey: configKey, newKey: envKey, value: value as string });
-    } catch (err) {
+    } catch (err: any) {
       if (err instanceof env.KeyValidationError) {
         errors.push({
           origKey: configKey,
@@ -169,14 +166,19 @@ export function hydrateEnvs(pInfos: ProjectConfigInfo[], prefix: string): string
   return errMsg;
 }
 
+const CHARACTERS_TO_ESCAPE_SEQUENCES: Record<string, string> = {
+  "\n": "\\n",
+  "\r": "\\r",
+  "\t": "\\t",
+  "\v": "\\v",
+  "\\": "\\\\",
+  '"': '\\"',
+  "'": "\\'",
+};
+
 function escape(s: string): string {
-  // Escape newlines and tabs
-  const result = s
-    .replace("\n", "\\n")
-    .replace("\r", "\\r")
-    .replace("\t", "\\t")
-    .replace("\v", "\\v");
-  return result.replace(/(['"])/g, "\\$1");
+  // Escape newlines, tabs, backslashes and quotes
+  return s.replace(/[\n\r\t\v\\"']/g, (ch) => CHARACTERS_TO_ESCAPE_SEQUENCES[ch]);
 }
 
 /**

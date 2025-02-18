@@ -1,4 +1,4 @@
-import { bold, yellow } from "cli-color";
+import { bold, yellow } from "colorette";
 
 import { Channel, createChannel, addAuthDomains, normalizeName } from "../hosting/api";
 import { Command } from "../command";
@@ -9,26 +9,40 @@ import { promptOnce } from "../prompt";
 import { requirePermissions } from "../requirePermissions";
 import { needProjectId } from "../projectUtils";
 import { logger } from "../logger";
-import * as requireConfig from "../requireConfig";
-import * as marked from "marked";
+import { requireConfig } from "../requireConfig";
+import { marked } from "marked";
 import { requireHostingSite } from "../requireHostingSite";
+import { errNoDefaultSite } from "../getDefaultHostingSite";
 
 const LOG_TAG = "hosting:channel";
 
-export default new Command("hosting:channel:create [channelId]")
+export const command = new Command("hosting:channel:create [channelId]")
   .description("create a Firebase Hosting channel")
   .option(
     "-e, --expires <duration>",
-    "duration string (e.g. 12h or 30d) for channel expiration, max 30d"
+    "duration string (e.g. 12h or 30d) for channel expiration, max 30d",
   )
   .option("--site <siteId>", "site for which to create the channel")
   .before(requireConfig)
   .before(requirePermissions, ["firebasehosting.sites.update"])
-  .before(requireHostingSite)
+  .before(async (options) => {
+    try {
+      await requireHostingSite(options);
+    } catch (err: unknown) {
+      if (err === errNoDefaultSite) {
+        throw new FirebaseError(
+          `Unable to deploy to Hosting as there is no Hosting site. Use ${bold(
+            "firebase hosting:sites:create",
+          )} to create a site.`,
+        );
+      }
+      throw err;
+    }
+  })
   .action(
     async (
       channelId: string,
-      options: any // eslint-disable-line @typescript-eslint/no-explicit-any
+      options: any, // eslint-disable-line @typescript-eslint/no-explicit-any
     ): Promise<Channel> => {
       const projectId = needProjectId(options);
       const site = options.site;
@@ -54,13 +68,13 @@ export default new Command("hosting:channel:create [channelId]")
       let channel: Channel;
       try {
         channel = await createChannel(projectId, site, channelId, expireTTL);
-      } catch (e) {
+      } catch (e: any) {
         if (e.status === 409) {
           throw new FirebaseError(
             `Channel ${bold(channelId)} already exists on site ${bold(site)}. Deploy to ${bold(
-              channelId
+              channelId,
             )} with: ${yellow(`firebase hosting:channel:deploy ${channelId}`)}`,
-            { original: e }
+            { original: e },
           );
         }
         throw e;
@@ -68,15 +82,15 @@ export default new Command("hosting:channel:create [channelId]")
 
       try {
         await addAuthDomains(projectId, [channel.url]);
-      } catch (e) {
+      } catch (e: any) {
         logLabeledWarning(
           LOG_TAG,
-          marked(
+          await marked(
             `Unable to add channel domain to Firebase Auth. Visit the Firebase Console at ${consoleUrl(
               projectId,
-              "/authentication/providers"
-            )}`
-          )
+              "/authentication/providers",
+            )}`,
+          ),
         );
         logger.debug("[hosting] unable to add auth domain", e);
       }
@@ -84,20 +98,20 @@ export default new Command("hosting:channel:create [channelId]")
       logger.info();
       logLabeledSuccess(
         LOG_TAG,
-        `Channel ${bold(channelId)} has been created on site ${bold(site)}.`
+        `Channel ${bold(channelId)} has been created on site ${bold(site)}.`,
       );
       logLabeledSuccess(
         LOG_TAG,
         `Channel ${bold(channelId)} will expire at ${bold(
-          datetimeString(new Date(channel.expireTime))
-        )}.`
+          datetimeString(new Date(channel.expireTime)),
+        )}.`,
       );
       logLabeledSuccess(LOG_TAG, `Channel URL: ${channel.url}`);
       logger.info();
       logger.info(
-        `To deploy to this channel, use ${yellow(`firebase hosting:channel:deploy ${channelId}`)}.`
+        `To deploy to this channel, use ${yellow(`firebase hosting:channel:deploy ${channelId}`)}.`,
       );
 
       return channel;
-    }
+    },
   );

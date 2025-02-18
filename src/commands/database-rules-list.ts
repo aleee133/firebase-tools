@@ -6,11 +6,11 @@ import * as metadata from "../database/metadata";
 import { Emulators } from "../emulator/types";
 import { warnEmulatorNotSupported } from "../emulator/commandUtils";
 
-export default new Command("database:rules:list")
+export const command = new Command("database:rules:list")
   .description("list realtime database rulesets")
   .option(
     "--instance <instance>",
-    "use the database <instance>.firebaseio.com (if omitted, uses default database instance)"
+    "use the database <instance>.firebaseio.com (if omitted, uses default database instance)",
   )
   .before(requirePermissions, ["firebasedatabase.instances.get"])
   .before(requireDatabaseInstance)
@@ -20,10 +20,10 @@ export default new Command("database:rules:list")
     const rulesets = await metadata.listAllRulesets(options.instance);
     for (const ruleset of rulesets) {
       const labels = [];
-      if (ruleset.id == labeled.stable) {
+      if (ruleset.id === labeled.stable) {
         labels.push("stable");
       }
-      if (ruleset.id == labeled.canary) {
+      if (ruleset.id === labeled.canary) {
         labels.push("canary");
       }
       logger.info(`${ruleset.id}  ${ruleset.createdAt}  ${labels.join(",")}`);

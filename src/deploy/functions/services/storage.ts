@@ -12,23 +12,15 @@ const PUBSUB_PUBLISHER_ROLE = "roles/pubsub.publisher";
  * @param projectId project identifier
  * @param existingPolicy the project level IAM policy
  */
-export async function obtainStorageBindings(
-  projectId: string,
-  existingPolicy: iam.Policy
-): Promise<Array<iam.Binding>> {
-  const storageResponse = await storage.getServiceAccount(projectId);
+export async function obtainStorageBindings(projectNumber: string): Promise<Array<iam.Binding>> {
+  const storageResponse = await storage.getServiceAccount(projectNumber);
   const storageServiceAgent = `serviceAccount:${storageResponse.email_address}`;
-  let pubsubBinding = existingPolicy.bindings.find((b) => b.role === PUBSUB_PUBLISHER_ROLE);
-  if (!pubsubBinding) {
-    pubsubBinding = {
-      role: PUBSUB_PUBLISHER_ROLE,
-      members: [],
-    };
-  }
-  if (!pubsubBinding.members.find((m) => m === storageServiceAgent)) {
-    pubsubBinding.members.push(storageServiceAgent); // add service agent to role
-  }
-  return [pubsubBinding];
+
+  const pubsubPublisherBinding = {
+    role: PUBSUB_PUBLISHER_ROLE,
+    members: [storageServiceAgent],
+  };
+  return [pubsubPublisherBinding];
 }
 
 /**
@@ -38,18 +30,27 @@ export async function obtainStorageBindings(
  * @param eventTrigger the endpoints event trigger
  */
 export async function ensureStorageTriggerRegion(
-  endpoint: backend.Endpoint,
-  eventTrigger: backend.EventTrigger
+  endpoint: backend.Endpoint & backend.EventTriggered,
 ): Promise<void> {
+  const { eventTrigger } = endpoint;
   if (!eventTrigger.region) {
     logger.debug("Looking up bucket region for the storage event trigger");
+    if (!eventTrigger.eventFilters?.bucket) {
+      throw new FirebaseError(
+        "Error: storage event trigger is missing bucket filter: " +
+          JSON.stringify(eventTrigger, null, 2),
+      );
+    }
+    logger.debug(
+      `Looking up bucket region for the storage event trigger on bucket ${eventTrigger.eventFilters.bucket}`,
+    );
     try {
       const bucket: { location: string } = await storage.getBucket(
-        eventTrigger.eventFilters.bucket!
+        eventTrigger.eventFilters.bucket,
       );
       eventTrigger.region = bucket.location.toLowerCase();
       logger.debug("Setting the event trigger region to", eventTrigger.region, ".");
-    } catch (err) {
+    } catch (err: any) {
       throw new FirebaseError("Can't find the storage bucket region", { original: err });
     }
   }
@@ -57,10 +58,10 @@ export async function ensureStorageTriggerRegion(
   if (
     endpoint.region !== eventTrigger.region &&
     eventTrigger.region !== "us-central1" && // GCF allows any trigger to be in us-central1
-    !regionInLocation(endpoint.region, eventTrigger.region!)
+    !regionInLocation(endpoint.region, eventTrigger.region)
   ) {
     throw new FirebaseError(
-      `A function in region ${endpoint.region} cannot listen to a bucket in region ${eventTrigger.region}`
+      `A function in region ${endpoint.region} cannot listen to a bucket in region ${eventTrigger.region}`,
     );
   }
 }

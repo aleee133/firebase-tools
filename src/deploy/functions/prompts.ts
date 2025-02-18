@@ -1,13 +1,14 @@
-import * as clc from "cli-color";
+import * as clc from "colorette";
 
 import { getFunctionLabel } from "./functionsDeployHelper";
 import { FirebaseError } from "../../error";
-import { promptOnce } from "../../prompt";
+import { confirm, promptOnce } from "../../prompt";
 import { logger } from "../../logger";
 import * as backend from "./backend";
 import * as pricing from "./pricing";
 import * as utils from "../../utils";
 import { Options } from "../../options";
+import { EndpointUpdate } from "./release/planner";
 
 /**
  * Checks if a deployment will create any functions with a failure policy
@@ -19,7 +20,7 @@ import { Options } from "../../options";
 export async function promptForFailurePolicies(
   options: Options,
   want: backend.Backend,
-  have: backend.Backend
+  have: backend.Backend,
 ): Promise<void> {
   // Collect all the functions that have a retry policy
   const retryEndpoints = backend.allEndpoints(want).filter((e) => {
@@ -35,7 +36,7 @@ export async function promptForFailurePolicies(
     return !(existing && backend.isEventTriggered(existing) && existing.eventTrigger.retry);
   });
 
-  if (newRetryEndpoints.length == 0) {
+  if (newRetryEndpoints.length === 0) {
     return;
   }
 
@@ -75,11 +76,10 @@ export async function promptForFailurePolicies(
  */
 export async function promptForFunctionDeletion(
   functionsToDelete: (backend.TargetIds & { platform: backend.FunctionsPlatform })[],
-  force: boolean,
-  nonInteractive: boolean
+  options: Options,
 ): Promise<boolean> {
   let shouldDeleteFns = true;
-  if (functionsToDelete.length === 0 || force) {
+  if (functionsToDelete.length === 0 || options.force) {
     return true;
   }
   const deleteList = functionsToDelete
@@ -87,7 +87,7 @@ export async function promptForFunctionDeletion(
     .map((fn) => "\t" + getFunctionLabel(fn))
     .join("\n");
 
-  if (nonInteractive) {
+  if (options.nonInteractive) {
     const deleteCommands = functionsToDelete
       .map((func) => {
         return "\tfirebase functions:delete " + func.id + " --region " + func.region;
@@ -98,7 +98,7 @@ export async function promptForFunctionDeletion(
       "The following functions are found in your project but do not exist in your local source code:\n" +
         deleteList +
         "\n\nAborting because deletion cannot proceed in non-interactive mode. To fix, manually delete the functions by running:\n" +
-        clc.bold(deleteCommands)
+        clc.bold(deleteCommands),
     );
   } else {
     logger.info(
@@ -106,11 +106,9 @@ export async function promptForFunctionDeletion(
         deleteList +
         "\n\nIf you are renaming a function or changing its region, it is recommended that you create the new " +
         "function first before deleting the old one to prevent event loss. For more info, visit " +
-        clc.underline("https://firebase.google.com/docs/functions/manage-functions#modify" + "\n")
+        clc.underline("https://firebase.google.com/docs/functions/manage-functions#modify" + "\n"),
     );
-    shouldDeleteFns = await promptOnce({
-      type: "confirm",
-      name: "confirm",
+    shouldDeleteFns = await confirm({
       default: false,
       message:
         "Would you like to proceed with deletion? Selecting no will continue the rest of the deployments.",
@@ -120,17 +118,76 @@ export async function promptForFunctionDeletion(
 }
 
 /**
+ * Prompts users to confirm potentially unsafe function updates.
+ * Cases include:
+ * Migrating from 2nd gen Firestore  triggers to Firestore triggers with auth context
+ * @param fnsToUpdate An array of endpoint updates
+ * @param options
+ * @return An array of endpoints to proceed with updating
+ */
+export async function promptForUnsafeMigration(
+  fnsToUpdate: EndpointUpdate[],
+  options: Options,
+): Promise<EndpointUpdate[]> {
+  const unsafeUpdates = fnsToUpdate.filter((eu) => eu.unsafe);
+
+  if (unsafeUpdates.length === 0 || options.force) {
+    return fnsToUpdate;
+  }
+
+  const warnMessage =
+    "The following functions are unsafely changing event types: " +
+    clc.bold(
+      unsafeUpdates
+        .map((eu) => eu.endpoint)
+        .sort(backend.compareFunctions)
+        .map(getFunctionLabel)
+        .join(", "),
+    ) +
+    ". " +
+    "While automatic migration is allowed for these functions, updating the underlying event type may result in data loss. " +
+    "To avoid this, consider the best practices outlined in the migration guide: https://firebase.google.com/docs/functions/manage-functions?gen=2nd#modify-trigger";
+
+  utils.logLabeledWarning("functions", warnMessage);
+
+  const safeUpdates = fnsToUpdate.filter((eu) => !eu.unsafe);
+
+  if (options.nonInteractive) {
+    utils.logLabeledWarning(
+      "functions",
+      "Skipping updates for functions that may be unsafe to update. To update these functions anyway, deploy again in interactive mode or use the --force option.",
+    );
+    return safeUpdates;
+  }
+
+  for (const eu of unsafeUpdates) {
+    const shouldUpdate = await promptOnce({
+      type: "confirm",
+      name: "confirm",
+      default: false,
+      message: `[${getFunctionLabel(
+        eu.endpoint,
+      )}] Would you like to proceed with the unsafe migration?`,
+    });
+    if (shouldUpdate) {
+      safeUpdates.push(eu);
+    }
+  }
+  return safeUpdates;
+}
+
+/**
  * Checks whether a deploy will increase the min instance idle time bill of
  * any function. Cases include:
- * * Setting minInstances on a new or existing function
- * * Increasing the minInstances of an existing function
- * * Increasing the CPU or memory of a function with min instances
+ * Setting minInstances on a new or existing function
+ * Increasing the minInstances of an existing function
+ * Increasing the CPU or memory of a function with min instances
  * If there are any, prompts the user to confirm a minimum bill.
  */
 export async function promptForMinInstances(
   options: Options,
   want: backend.Backend,
-  have: backend.Backend
+  have: backend.Backend,
 ): Promise<void> {
   if (options.force) {
     return;
@@ -163,7 +220,7 @@ export async function promptForMinInstances(
       "Pass the --force option to deploy functions that increase the minimum bill",
       {
         exit: 1,
-      }
+      },
     );
   }
 
@@ -177,7 +234,7 @@ export async function promptForMinInstances(
     .map((fn) => {
       return (
         `\t${getFunctionLabel(fn)}: ${fn.minInstances} instances, ` +
-        backend.memoryOptionDisplayName(fn.availableMemoryMb || 256) +
+        backend.memoryOptionDisplayName(fn.availableMemoryMb || backend.DEFAULT_MEMORY) +
         " of memory each"
       );
     })
@@ -192,11 +249,6 @@ export async function promptForMinInstances(
     const cost = pricing.monthlyMinInstanceCost(backend.allEndpoints(want)).toFixed(2);
     costLine = `With these options, your minimum bill will be $${cost} in a 30-day month`;
   }
-  let cudAnnotation = "";
-  if (backend.someEndpoint(want, (fn) => fn.platform == "gcfv2" && !!fn.minInstances)) {
-    cudAnnotation =
-      "\nThis bill can be lowered with a one year commitment. See https://cloud.google.com/run/cud for more";
-  }
   const warnMessage =
     "The following functions have reserved minimum instances. This will " +
     "reduce the frequency of cold starts but increases the minimum cost. " +
@@ -204,8 +256,7 @@ export async function promptForMinInstances(
     "CPU allocation of instances while they are idle.\n\n" +
     functionLines +
     "\n\n" +
-    costLine +
-    cudAnnotation;
+    costLine;
 
   utils.logLabeledWarning("functions", warnMessage);
 

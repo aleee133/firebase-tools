@@ -3,10 +3,9 @@
 // of writing, we can make 50K requests per 10m.
 // https://cloud.google.com/container-registry/quotas
 
-import * as clc from "cli-color";
+import * as clc from "colorette";
 
 import { FirebaseError } from "../../error";
-import { previews } from "../../previews";
 import { artifactRegistryDomain, containerRegistryDomain } from "../../api";
 import { logger } from "../../logger";
 import * as artifactregistry from "../../gcp/artifactregistry";
@@ -28,11 +27,11 @@ async function retry<Return>(func: () => Promise<Return>): Promise<Return> {
         setTimeout(() => reject(new Error("Timeout")), TIMEOUT_MS);
       });
       return await Promise.race([func(), timeout]);
-    } catch (error) {
-      logger.debug("Failed docker command with error ", error);
+    } catch (err: any) {
+      logger.debug("Failed docker command with error ", err);
       retry += 1;
       if (retry >= MAX_RETRIES) {
-        throw new FirebaseError("Failed to clean up artifacts", { original: error });
+        throw new FirebaseError("Failed to clean up artifacts", { original: err });
       }
       await sleep(Math.pow(INITIAL_BACKOFF, retry - 1));
     }
@@ -42,9 +41,9 @@ async function retry<Return>(func: () => Promise<Return>): Promise<Return> {
 export async function cleanupBuildImages(
   haveFunctions: backend.TargetIds[],
   deletedFunctions: backend.TargetIds[],
-  cleaners: { gcr?: ContainerRegistryCleaner; ar?: ArtifactRegistryCleaner } = {}
+  cleaners: { gcr?: ContainerRegistryCleaner; ar?: ArtifactRegistryCleaner } = {},
 ): Promise<void> {
-  utils.logBullet(clc.bold.cyan("functions: ") + "cleaning up build files...");
+  utils.logBullet(clc.bold(clc.cyan("functions: ")) + "cleaning up build files...");
   const failedDomains: Set<string> = new Set();
   const cleanup: Array<Promise<void>> = [];
   const arCleaner = cleaners.ar || new ArtifactRegistryCleaner();
@@ -55,32 +54,32 @@ export async function cleanupBuildImages(
     ...haveFunctions.map(async (func) => {
       try {
         await arCleaner.cleanupFunction(func);
-      } catch (err) {
+      } catch (err: any) {
         const path = `${func.project}/${func.region}/gcf-artifacts`;
         failedDomains.add(`https://console.cloud.google.com/artifacts/docker/${path}`);
       }
-    })
+    }),
   );
   cleanup.push(
     ...deletedFunctions.map(async (func) => {
       try {
-        await Promise.all([arCleaner.cleanupFunction(func), arCleaner.cleanupFunctionCache(func)]);
-      } catch (err) {
+        await arCleaner.cleanupFunction(func);
+      } catch (err: any) {
         const path = `${func.project}/${func.region}/gcf-artifacts`;
         failedDomains.add(`https://console.cloud.google.com/artifacts/docker/${path}`);
       }
-    })
+    }),
   );
   const gcrCleaner = cleaners.gcr || new ContainerRegistryCleaner();
   cleanup.push(
     ...[...haveFunctions, ...deletedFunctions].map(async (func) => {
       try {
         await gcrCleaner.cleanupFunction(func);
-      } catch (err) {
+      } catch (err: any) {
         const path = `${func.project}/${docker.GCR_SUBDOMAIN_MAPPING[func.region]}/gcf`;
         failedDomains.add(`https://console.cloud.google.com/gcr/images/${path}`);
       }
-    })
+    }),
   );
   await Promise.all(cleanup);
   if (failedDomains.size) {
@@ -88,7 +87,7 @@ export async function cleanupBuildImages(
       "Unhandled error cleaning up build images. This could result in a small monthly bill if not corrected. ";
     message +=
       "You can attempt to delete these images by redeploying or you can delete them manually at";
-    if (failedDomains.size == 1) {
+    if (failedDomains.size === 1) {
       message += " " + failedDomains.values().next().value;
     } else {
       message += [...failedDomains].map((domain) => "\n\t" + domain).join("");
@@ -117,7 +116,7 @@ export class ArtifactRegistryCleaner {
   }
 
   static POLLER_OPTIONS = {
-    apiOrigin: artifactRegistryDomain,
+    apiOrigin: artifactRegistryDomain(),
     apiVersion: artifactregistry.API_VERSION,
     masterTimeout: 5 * 60 * 1_000,
   };
@@ -135,7 +134,7 @@ export class ArtifactRegistryCleaner {
     let op: artifactregistry.Operation;
     try {
       op = await artifactregistry.deletePackage(ArtifactRegistryCleaner.packagePath(func));
-    } catch (err) {
+    } catch (err: any) {
       // The client was not enrolled in the AR experimenet and the package
       // was missing
       if (err.status === 404) {
@@ -152,31 +151,11 @@ export class ArtifactRegistryCleaner {
       operationResourceName: op.name,
     });
   }
-
-  async cleanupFunctionCache(func: backend.TargetIds): Promise<void> {
-    // GCF uses "<id>/cache" as their pacakge name, but AR percent-encodes this to
-    // avoid parsing issues with OP.
-    const op = await artifactregistry.deletePackage(
-      `${ArtifactRegistryCleaner.packagePath(func)}%2Fcache`
-    );
-    if (op.done) {
-      return;
-    }
-    await poller.pollOperation<void>({
-      ...ArtifactRegistryCleaner.POLLER_OPTIONS,
-      pollerName: `cleanup-cache-${func.region}-${func.id}`,
-      operationResourceName: op.name,
-    });
-  }
 }
 
 // Temporary class to turn off AR cleaning if AR isn't enabled yet
 export class NoopArtifactRegistryCleaner extends ArtifactRegistryCleaner {
   cleanupFunction(): Promise<void> {
-    return Promise.resolve();
-  }
-
-  cleanupFunctionCache(): Promise<void> {
     return Promise.resolve();
   }
 }
@@ -187,7 +166,7 @@ export class ContainerRegistryCleaner {
   private helper(location: string): DockerHelper {
     const subdomain = docker.GCR_SUBDOMAIN_MAPPING[location] || "us";
     if (!this.helpers[subdomain]) {
-      const origin = `https://${subdomain}.${containerRegistryDomain}`;
+      const origin = `https://${subdomain}.${containerRegistryDomain()}`;
       this.helpers[subdomain] = new DockerHelper(origin);
     }
     return this.helpers[subdomain];
@@ -220,7 +199,7 @@ export class ContainerRegistryCleaner {
           const path = `${func.project}/gcf/${func.region}/${uuid}`;
           const tags = (await helper.ls(path)).tags;
           uuidTags[path] = tags;
-        })()
+        })(),
       );
     }
     await Promise.all(loadUuidTags);
@@ -240,7 +219,7 @@ export class ContainerRegistryCleaner {
 
 function getHelper(cache: Record<string, DockerHelper>, subdomain: string): DockerHelper {
   if (!cache[subdomain]) {
-    cache[subdomain] = new DockerHelper(`https://${subdomain}.${containerRegistryDomain}`);
+    cache[subdomain] = new DockerHelper(`https://${subdomain}.${containerRegistryDomain()}`);
   }
   return cache[subdomain];
 }
@@ -250,14 +229,13 @@ function getHelper(cache: Record<string, DockerHelper>, subdomain: string): Dock
  * @param projectId: the current project that contains GCF artifacts
  * @param location: the specific region to search for artifacts. If omitted, will search all locations.
  * @param dockerHelpers: a map of {@link SUBDOMAINS} to {@link DockerHelper}. If omitted, will use the default value and create each {@link DockerHelper} internally.
- *
  * @throws {@link FirebaseError}
  * Thrown if the provided location is not a valid Google Cloud region or we fail to search subdomains.
  */
 export async function listGcfPaths(
   projectId: string,
   locations?: string[],
-  dockerHelpers: Record<string, DockerHelper> = {}
+  dockerHelpers: Record<string, DockerHelper> = {},
 ): Promise<string[]> {
   if (!locations) {
     locations = Object.keys(docker.GCR_SUBDOMAIN_MAPPING);
@@ -276,7 +254,7 @@ export async function listGcfPaths(
       (async () => {
         try {
           return getHelper(dockerHelpers, subdomain).ls(`${projectId}/gcf`);
-        } catch (err) {
+        } catch (err: any) {
           failedSubdomains.push(subdomain);
           logger.debug(err);
           const stat: Stat = {
@@ -286,7 +264,7 @@ export async function listGcfPaths(
           };
           return Promise.resolve(stat);
         }
-      })()
+      })(),
     );
   }
 
@@ -295,16 +273,16 @@ export async function listGcfPaths(
     .reduce((acc, val) => [...acc, ...val], [])
     .filter((loc) => locationsSet.has(loc));
 
-  if (failedSubdomains.length == subdomains.size) {
+  if (failedSubdomains.length === subdomains.size) {
     throw new FirebaseError("Failed to search all subdomains.");
   } else if (failedSubdomains.length > 0) {
     throw new FirebaseError(
-      `Failed to search the following subdomains: ${failedSubdomains.join(",")}`
+      `Failed to search the following subdomains: ${failedSubdomains.join(",")}`,
     );
   }
 
   return gcfDirs.map((loc) => {
-    return `${docker.GCR_SUBDOMAIN_MAPPING[loc]}.${containerRegistryDomain}/${projectId}/gcf/${loc}`;
+    return `${docker.GCR_SUBDOMAIN_MAPPING[loc]}.${containerRegistryDomain()}/${projectId}/gcf/${loc}`;
   });
 }
 
@@ -313,14 +291,13 @@ export async function listGcfPaths(
  * @param projectId: the current project that contains GCF artifacts
  * @param location: the specific region to be clean up. If omitted, will delete all locations.
  * @param dockerHelpers: a map of {@link SUBDOMAINS} to {@link DockerHelper}. If omitted, will use the default value and create each {@link DockerHelper} internally.
- *
  * @throws {@link FirebaseError}
  * Thrown if the provided location is not a valid Google Cloud region or we fail to delete subdomains.
  */
 export async function deleteGcfArtifacts(
   projectId: string,
   locations?: string[],
-  dockerHelpers: Record<string, DockerHelper> = {}
+  dockerHelpers: Record<string, DockerHelper> = {},
 ): Promise<void> {
   if (!locations) {
     locations = Object.keys(docker.GCR_SUBDOMAIN_MAPPING);
@@ -336,18 +313,18 @@ export async function deleteGcfArtifacts(
     const subdomain = docker.GCR_SUBDOMAIN_MAPPING[loc]!;
     try {
       return getHelper(dockerHelpers, subdomain).rm(`${projectId}/gcf/${loc}`);
-    } catch (err) {
+    } catch (err: any) {
       failedSubdomains.push(subdomain);
       logger.debug(err);
     }
   });
   await Promise.all(deleteLocations);
 
-  if (failedSubdomains.length == subdomains.size) {
+  if (failedSubdomains.length === subdomains.size) {
     throw new FirebaseError("Failed to search all subdomains.");
   } else if (failedSubdomains.length > 0) {
     throw new FirebaseError(
-      `Failed to search the following subdomains: ${failedSubdomains.join(",")}`
+      `Failed to search the following subdomains: ${failedSubdomains.join(",")}`,
     );
   }
 }
@@ -360,20 +337,24 @@ export interface Stat {
 
 export class DockerHelper {
   readonly client: docker.Client;
-  readonly cache: Record<string, Stat> = {};
+  readonly cache: Record<string, Promise<Stat>> = {};
 
   constructor(origin: string) {
     this.client = new docker.Client(origin);
   }
 
+  // N.B. It is very important that this function assigns to the cache before
+  // yielding the runloop or parallel executions will race their LS calls, which
+  // are each recursive, leading to possible N^2 executions.
   async ls(path: string): Promise<Stat> {
-    if (!this.cache[path]) {
-      const raw = await retry(() => this.client.listTags(path));
-      this.cache[path] = {
-        tags: raw.tags,
-        digests: Object.keys(raw.manifest),
-        children: raw.child,
-      };
+    if (!(path in this.cache)) {
+      this.cache[path] = retry(() => this.client.listTags(path)).then((res) => {
+        return {
+          tags: res.tags,
+          digests: Object.keys(res.manifest),
+          children: res.child,
+        };
+      });
     }
     return this.cache[path];
   }
@@ -387,7 +368,7 @@ export class DockerHelper {
       try {
         await this.rm(`${path}/${child}`);
         stat.children.splice(stat.children.indexOf(child), 1);
-      } catch (err) {
+      } catch (err: any) {
         toThrowLater = err;
       }
     });
@@ -400,7 +381,7 @@ export class DockerHelper {
       try {
         await retry(() => this.client.deleteTag(path, tag));
         stat.tags.splice(stat.tags.indexOf(tag), 1);
-      } catch (err) {
+      } catch (err: any) {
         logger.debug("Got error trying to remove docker tag:", err);
         toThrowLater = err;
       }
@@ -411,7 +392,7 @@ export class DockerHelper {
       try {
         await retry(() => this.client.deleteImage(path, digest));
         stat.digests.splice(stat.digests.indexOf(digest), 1);
-      } catch (err) {
+      } catch (err: any) {
         logger.debug("Got error trying to remove docker image:", err);
         toThrowLater = err;
       }

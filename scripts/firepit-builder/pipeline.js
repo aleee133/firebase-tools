@@ -42,7 +42,7 @@ if (fs.existsSync(firebaseToolsPackage)) {
   npm("install", packedModule);
   rm(packedModule);
 } else {
-  npm("install", firebaseToolsPackage);
+  npm("install", "--omit=dev", firebaseToolsPackage);
 }
 
 const packageJson = JSON.parse(cat("node_modules/firebase-tools/package.json"));
@@ -133,7 +133,7 @@ cd(outputDir);
 console.log(
   ls(".")
     .map((fn) => path.join(pwd().toString(), fn.toString()))
-    .join("\n")
+    .join("\n"),
 );
 
 // Cleanup

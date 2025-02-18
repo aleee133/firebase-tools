@@ -3,11 +3,7 @@ import * as crypto from "crypto";
 import { EmulatorRegistry } from "../registry";
 import { Emulators } from "../types";
 import { StorageCloudFunctions } from "./cloudFunctions";
-import { crc32c } from "./crc";
-
-type RulesResourceMetadataOverrides = {
-  [Property in keyof RulesResourceMetadata]?: RulesResourceMetadata[Property];
-};
+import { crc32c, crc32cToString } from "./crc";
 
 type SerializedFileMetadata = Omit<StoredFileMetadata, "timeCreated" | "updated"> & {
   timeCreated: string;
@@ -23,14 +19,14 @@ export class StoredFileMetadata {
   bucket: string;
   generation: number;
   metageneration: number;
-  contentType: string;
+  contentType?: string;
   timeCreated: Date;
   updated: Date;
   storageClass: string;
   size: number;
   md5Hash: string;
-  contentEncoding: string;
-  contentDisposition: string;
+  contentEncoding?: string;
+  contentDisposition?: string;
   contentLanguage?: string;
   cacheControl?: string;
   customTime?: Date;
@@ -43,29 +39,40 @@ export class StoredFileMetadata {
     opts: Partial<SerializedFileMetadata> & {
       name: string;
       bucket: string;
-      contentType: string;
     },
     private _cloudFunctions: StorageCloudFunctions,
     bytes?: Buffer,
-    incomingMetadata?: IncomingMetadata
   ) {
     // Required fields
     this.name = opts.name;
     this.bucket = opts.bucket;
-    this.contentType = opts.contentType;
 
     // Optional fields
     this.metageneration = opts.metageneration || 1;
     this.generation = opts.generation || Date.now();
+    this.contentType = opts.contentType || "application/octet-stream";
     this.storageClass = opts.storageClass || "STANDARD";
-    this.etag = opts.etag || "someETag";
-    this.contentDisposition = opts.contentDisposition || "inline";
+    this.contentDisposition = opts.contentDisposition;
     this.cacheControl = opts.cacheControl;
     this.contentLanguage = opts.contentLanguage;
     this.customTime = opts.customTime;
-    this.contentEncoding = opts.contentEncoding || "identity";
-    this.customMetadata = opts.customMetadata;
+    this.contentEncoding = opts.contentEncoding;
     this.downloadTokens = opts.downloadTokens || [];
+    if (opts.etag) {
+      this.etag = opts.etag;
+    } else {
+      this.etag = generateETag(this.generation, this.metageneration);
+    }
+    if (opts.customMetadata) {
+      this.customMetadata = {};
+      for (const [k, v] of Object.entries(opts.customMetadata)) {
+        let stringVal = v;
+        if (typeof stringVal !== "string") {
+          stringVal = JSON.stringify(v);
+        }
+        this.customMetadata[k] = stringVal || "";
+      }
+    }
 
     // Special handling for date fields
     this.timeCreated = opts.timeCreated ? new Date(opts.timeCreated) : new Date();
@@ -84,51 +91,60 @@ export class StoredFileMetadata {
       throw new Error("Must pass bytes array or opts object with size, md5hash, and crc32c");
     }
 
-    if (incomingMetadata) {
-      this.update(incomingMetadata);
-    }
-
     this.deleteFieldsSetAsNull();
     this.setDownloadTokensFromCustomMetadata();
   }
 
-  asRulesResource(proposedChanges?: RulesResourceMetadataOverrides): RulesResourceMetadata {
-    let rulesResource: RulesResourceMetadata = {
-      name: this.name,
-      bucket: this.bucket,
-      generation: this.generation,
-      metageneration: this.metageneration,
-      size: this.size,
-      timeCreated: this.timeCreated,
-      updated: this.updated,
-      md5Hash: this.md5Hash,
-      crc32c: this.crc32c,
-      etag: this.etag,
-      contentDisposition: this.contentDisposition,
-      contentEncoding: this.contentEncoding,
-      contentType: this.contentType,
-      metadata: this.customMetadata || {},
-    };
+  /** Creates a deep copy of a StoredFileMetadata. */
+  clone(): StoredFileMetadata {
+    const clone = new StoredFileMetadata(
+      {
+        name: this.name,
+        bucket: this.bucket,
+        generation: this.generation,
+        metageneration: this.metageneration,
+        contentType: this.contentType,
+        storageClass: this.storageClass,
+        size: this.size,
+        md5Hash: this.md5Hash,
+        contentEncoding: this.contentEncoding,
+        contentDisposition: this.contentDisposition,
+        contentLanguage: this.contentLanguage,
+        cacheControl: this.cacheControl,
+        customTime: this.customTime,
+        crc32c: this.crc32c,
+        etag: this.etag,
+        downloadTokens: this.downloadTokens,
+        customMetadata: this.customMetadata,
+      },
+      this._cloudFunctions,
+    );
+    clone.timeCreated = this.timeCreated;
+    clone.updated = this.updated;
+    return clone;
+  }
 
+  asRulesResource(proposedChanges?: IncomingMetadata): RulesResourceMetadata {
+    const proposedMetadata: StoredFileMetadata = this.clone();
     if (proposedChanges) {
-      if (proposedChanges.md5Hash !== rulesResource.md5Hash) {
-        // Step the generation forward and reset values
-        rulesResource.generation = Date.now();
-        rulesResource.metageneration = 1;
-        rulesResource.timeCreated = new Date();
-        rulesResource.updated = rulesResource.timeCreated;
-      } else {
-        // Otherwise this was just a metadata change
-        rulesResource.metageneration++;
-      }
-
-      rulesResource = {
-        ...rulesResource,
-        ...proposedChanges,
-      };
+      proposedMetadata.update(proposedChanges, /* shouldTrigger = */ false);
     }
-
-    return rulesResource;
+    return {
+      name: proposedMetadata.name,
+      bucket: proposedMetadata.bucket,
+      generation: proposedMetadata.generation,
+      metageneration: proposedMetadata.metageneration,
+      size: proposedMetadata.size,
+      timeCreated: proposedMetadata.timeCreated,
+      updated: proposedMetadata.updated,
+      md5Hash: proposedMetadata.md5Hash,
+      crc32c: proposedMetadata.crc32c,
+      etag: proposedMetadata.etag,
+      contentDisposition: proposedMetadata.contentDisposition,
+      contentEncoding: proposedMetadata.contentEncoding,
+      contentType: proposedMetadata.contentType,
+      metadata: proposedMetadata.customMetadata || {},
+    };
   }
 
   private setDownloadTokensFromCustomMetadata() {
@@ -138,8 +154,10 @@ export class StoredFileMetadata {
 
     if (this.customMetadata.firebaseStorageDownloadTokens) {
       this.downloadTokens = [
-        ...this.downloadTokens,
-        ...this.customMetadata.firebaseStorageDownloadTokens.split(","),
+        ...new Set([
+          ...this.downloadTokens,
+          ...this.customMetadata.firebaseStorageDownloadTokens.split(","),
+        ]),
       ];
       delete this.customMetadata.firebaseStorageDownloadTokens;
     }
@@ -170,51 +188,64 @@ export class StoredFileMetadata {
     }
   }
 
-  update(incoming: IncomingMetadata): void {
-    if (incoming.contentDisposition) {
-      this.contentDisposition = incoming.contentDisposition;
+  // IncomingMetadata fields are set to `null` by clients to unset the metadata fields.
+  // If they are undefined in IncomingMetadata, then the fields should be ignored.
+  update(incoming: IncomingMetadata, shouldTrigger = true): void {
+    if (incoming.contentDisposition !== undefined) {
+      this.contentDisposition =
+        incoming.contentDisposition === null ? undefined : incoming.contentDisposition;
     }
 
-    if (incoming.contentType) {
-      this.contentType = incoming.contentType;
+    if (incoming.contentType !== undefined) {
+      this.contentType = incoming.contentType === null ? undefined : incoming.contentType;
     }
 
-    if (incoming.metadata) {
-      this.customMetadata = incoming.metadata;
+    if (incoming.contentLanguage !== undefined) {
+      this.contentLanguage =
+        incoming.contentLanguage === null ? undefined : incoming.contentLanguage;
     }
 
-    if (incoming.contentLanguage) {
-      this.contentLanguage = incoming.contentLanguage;
+    if (incoming.contentEncoding !== undefined) {
+      this.contentEncoding =
+        incoming.contentEncoding === null ? undefined : incoming.contentEncoding;
     }
 
-    if (incoming.contentEncoding) {
-      this.contentEncoding = incoming.contentEncoding;
+    if (incoming.cacheControl !== undefined) {
+      this.cacheControl = incoming.cacheControl === null ? undefined : incoming.cacheControl;
     }
 
-    if (this.generation) {
-      this.generation++;
+    if (incoming.metadata !== undefined) {
+      if (incoming.metadata === null) {
+        this.customMetadata = undefined;
+      } else {
+        this.customMetadata = this.customMetadata || {};
+        for (const [k, v] of Object.entries(incoming.metadata)) {
+          // Clients can set custom metadata fields to null to unset them.
+          if (v === null) {
+            delete this.customMetadata[k];
+          } else {
+            // Convert all values to strings
+            this.customMetadata[k] = String(v);
+          }
+        }
+        // Clear out custom metadata if there are no more keys.
+        if (Object.keys(this.customMetadata).length === 0) {
+          this.customMetadata = undefined;
+        }
+      }
     }
 
+    this.metageneration++;
     this.updated = new Date();
-
-    if (incoming.cacheControl) {
-      this.cacheControl = incoming.cacheControl;
-    }
-
     this.setDownloadTokensFromCustomMetadata();
-    this.deleteFieldsSetAsNull();
-
-    this._cloudFunctions.dispatch("metadataUpdate", new CloudStorageObjectMetadata(this));
+    if (shouldTrigger) {
+      this._cloudFunctions.dispatch("metadataUpdate", new CloudStorageObjectMetadata(this));
+    }
   }
 
-  addDownloadToken(): void {
-    if (!this.downloadTokens.length) {
-      this.downloadTokens.push(uuid.v4());
-      return;
-    }
-
-    this.downloadTokens = [...this.downloadTokens, uuid.v4()];
-    this.update({});
+  addDownloadToken(shouldTrigger = true): void {
+    this.downloadTokens = [...(this.downloadTokens || []), uuid.v4()];
+    this.update({}, shouldTrigger);
   }
 
   deleteDownloadToken(token: string): void {
@@ -222,11 +253,12 @@ export class StoredFileMetadata {
       return;
     }
 
-    const remainingTokens = this.downloadTokens.filter((t) => t != token);
+    const remainingTokens = this.downloadTokens.filter((t) => t !== token);
     this.downloadTokens = remainingTokens;
-    if (remainingTokens.length == 0) {
+    if (remainingTokens.length === 0) {
       // if empty after deleting, always add a new token.
-      this.addDownloadToken();
+      // shouldTrigger is false as it's taken care of in the subsequent update
+      this.addDownloadToken(/* shouldTrigger = */ false);
     }
     this.update({});
   }
@@ -246,7 +278,7 @@ export class StoredFileMetadata {
 
         return value;
       },
-      2
+      2,
     );
   }
 }
@@ -262,19 +294,20 @@ export interface RulesResourceMetadata {
   md5Hash: string;
   crc32c: string;
   etag: string;
-  contentDisposition: string;
-  contentEncoding: string;
-  contentType: string;
+  contentDisposition?: string;
+  contentEncoding?: string;
+  contentType?: string;
   metadata: { [s: string]: string };
 }
 
 export interface IncomingMetadata {
-  contentType?: string;
-  contentLanguage?: string;
-  contentEncoding?: string;
-  contentDisposition?: string;
-  cacheControl?: string;
-  metadata?: { [s: string]: string };
+  name?: string;
+  contentType?: string | null;
+  contentLanguage?: string | null;
+  contentEncoding?: string | null;
+  contentDisposition?: string | null;
+  cacheControl?: string | null;
+  metadata?: { [s: string]: string | null } | null;
 }
 
 export class OutgoingFirebaseMetadata {
@@ -282,45 +315,45 @@ export class OutgoingFirebaseMetadata {
   bucket: string;
   generation: string;
   metageneration: string;
-  contentType: string;
+  contentType?: string;
   timeCreated: string;
   updated: string;
   storageClass: string;
   size: string;
   md5Hash: string;
-  contentEncoding: string;
-  contentDisposition: string;
+  contentEncoding?: string;
+  contentDisposition?: string;
   contentLanguage?: string;
   cacheControl?: string;
   crc32c: string;
   etag: string;
   downloadTokens: string;
-  metadata: object | undefined;
+  metadata?: object;
 
-  constructor(md: StoredFileMetadata) {
-    this.name = md.name;
-    this.bucket = md.bucket;
-    this.generation = md.generation.toString();
-    this.metageneration = md.metageneration.toString();
-    this.contentType = md.contentType;
-    this.timeCreated = toSerializedDate(md.timeCreated);
-    this.updated = toSerializedDate(md.updated);
-    this.storageClass = md.storageClass;
-    this.size = md.size.toString();
-    this.md5Hash = md.md5Hash;
-    this.crc32c = md.crc32c;
-    this.etag = md.etag;
-    this.downloadTokens = md.downloadTokens.join(",");
-    this.contentEncoding = md.contentEncoding;
-    this.contentDisposition = md.contentDisposition;
-    this.metadata = md.customMetadata;
-    this.contentLanguage = md.contentLanguage;
-    this.cacheControl = md.cacheControl;
+  constructor(metadata: StoredFileMetadata) {
+    this.name = metadata.name;
+    this.bucket = metadata.bucket;
+    this.generation = metadata.generation.toString();
+    this.metageneration = metadata.metageneration.toString();
+    this.contentType = metadata.contentType;
+    this.timeCreated = toSerializedDate(metadata.timeCreated);
+    this.updated = toSerializedDate(metadata.updated);
+    this.storageClass = metadata.storageClass;
+    this.size = metadata.size.toString();
+    this.md5Hash = metadata.md5Hash;
+    this.crc32c = metadata.crc32c;
+    this.etag = metadata.etag;
+    this.downloadTokens = metadata.downloadTokens.join(",");
+    this.contentEncoding = metadata.contentEncoding || "identity";
+    this.contentDisposition = metadata.contentDisposition;
+    this.metadata = metadata.customMetadata;
+    this.contentLanguage = metadata.contentLanguage;
+    this.cacheControl = metadata.cacheControl;
   }
 }
 
 export class CloudStorageBucketMetadata {
-  kind = "#storage/bucket";
+  kind = "storage#bucket";
   selfLink: string;
   id: string;
   name: string;
@@ -336,9 +369,11 @@ export class CloudStorageBucketMetadata {
   constructor(id: string) {
     this.name = id;
     this.id = id;
-    this.selfLink = `http://${EmulatorRegistry.getInfo(Emulators.STORAGE)?.host}:${
-      EmulatorRegistry.getInfo(Emulators.STORAGE)?.port
-    }/v1/b/${this.id}`;
+
+    const selfLink = EmulatorRegistry.url(Emulators.STORAGE);
+    selfLink.pathname = `/v1/b/${this.id}`;
+    this.selfLink = selfLink.toString();
+
     this.timeCreated = toSerializedDate(new Date());
     this.updated = this.timeCreated;
     this.projectNumber = "000000000000";
@@ -346,7 +381,7 @@ export class CloudStorageBucketMetadata {
     this.location = "US";
     this.storageClass = "STANDARD";
     this.etag = "====";
-    this.locationType = "mutli-region";
+    this.locationType = "multi-region";
   }
 }
 
@@ -361,17 +396,17 @@ export class CloudStorageObjectAccessControlMetadata {
     public role: string,
     public entity: string,
     public bucket: string,
-    public etag: string
+    public etag: string,
   ) {}
 }
 
 export class CloudStorageObjectMetadata {
-  kind = "#storage#object";
+  kind = "storage#object";
   name: string;
   bucket: string;
   generation: string;
   metageneration: string;
-  contentType: string;
+  contentType?: string;
   timeCreated: string;
   updated: string;
   storageClass: string;
@@ -381,38 +416,41 @@ export class CloudStorageObjectMetadata {
   etag: string;
   metadata?: { [s: string]: string };
   contentLanguage?: string;
+  contentDisposition?: string;
   cacheControl?: string;
+  contentEncoding?: string;
   customTime?: string;
   id: string;
   timeStorageClassUpdated: string;
   selfLink: string;
   mediaLink: string;
 
-  constructor(md: StoredFileMetadata) {
-    this.name = md.name;
-    this.bucket = md.bucket;
-    this.generation = md.generation.toString();
-    this.metageneration = md.metageneration.toString();
-    this.contentType = md.contentType;
-    this.timeCreated = toSerializedDate(md.timeCreated);
-    this.updated = toSerializedDate(md.updated);
-    this.storageClass = md.storageClass;
-    this.size = md.size.toString();
-    this.md5Hash = md.md5Hash;
-    this.etag = md.etag;
+  constructor(metadata: StoredFileMetadata) {
+    this.name = metadata.name;
+    this.bucket = metadata.bucket;
+    this.generation = metadata.generation.toString();
+    this.metageneration = metadata.metageneration.toString();
+    this.contentType = metadata.contentType;
+    this.contentDisposition = metadata.contentDisposition;
+    this.timeCreated = toSerializedDate(metadata.timeCreated);
+    this.updated = toSerializedDate(metadata.updated);
+    this.storageClass = metadata.storageClass;
+    this.size = metadata.size.toString();
+    this.md5Hash = metadata.md5Hash;
+    this.etag = metadata.etag;
     this.metadata = {};
 
-    if (Object.keys(md.customMetadata || {})) {
+    if (Object.keys(metadata.customMetadata || {})) {
       this.metadata = {
         ...this.metadata,
-        ...md.customMetadata,
+        ...metadata.customMetadata,
       };
     }
 
-    if (md.downloadTokens.length) {
+    if (metadata.downloadTokens.length) {
       this.metadata = {
         ...this.metadata,
-        firebaseStorageDownloadTokens: md.downloadTokens.join(","),
+        firebaseStorageDownloadTokens: metadata.downloadTokens.join(","),
       };
     }
 
@@ -420,31 +458,43 @@ export class CloudStorageObjectMetadata {
       delete this.metadata;
     }
 
-    if (md.contentLanguage) {
-      this.contentLanguage = md.contentLanguage;
+    if (metadata.contentLanguage) {
+      this.contentLanguage = metadata.contentLanguage;
     }
 
-    if (md.cacheControl) {
-      this.cacheControl = md.cacheControl;
+    if (metadata.cacheControl) {
+      this.cacheControl = metadata.cacheControl;
     }
 
-    if (md.customTime) {
-      this.customTime = toSerializedDate(md.customTime);
+    if (metadata.contentDisposition) {
+      this.contentDisposition = metadata.contentDisposition;
     }
 
-    // I'm not sure why but @google-cloud/storage calls .substr(4) on this value, so we need to pad it.
-    this.crc32c = "----" + Buffer.from([md.crc32c]).toString("base64");
+    if (metadata.contentEncoding) {
+      this.contentEncoding = metadata.contentEncoding;
+    }
 
-    this.timeStorageClassUpdated = toSerializedDate(md.timeCreated);
-    this.id = `${md.bucket}/${md.name}/${md.generation}`;
-    this.selfLink = `http://${EmulatorRegistry.getInfo(Emulators.STORAGE)?.host}:${
-      EmulatorRegistry.getInfo(Emulators.STORAGE)?.port
-    }/storage/v1/b/${md.bucket}/o/${encodeURIComponent(md.name)}`;
-    this.mediaLink = `http://${EmulatorRegistry.getInfo(Emulators.STORAGE)?.host}:${
-      EmulatorRegistry.getInfo(Emulators.STORAGE)?.port
-    }/download/storage/v1/b/${md.bucket}/o/${encodeURIComponent(md.name)}?generation=${
-      md.generation
-    }&alt=media`;
+    if (metadata.customTime) {
+      this.customTime = toSerializedDate(metadata.customTime);
+    }
+
+    this.crc32c = crc32cToString(metadata.crc32c);
+
+    this.timeStorageClassUpdated = toSerializedDate(metadata.timeCreated);
+    this.id = `${metadata.bucket}/${metadata.name}/${metadata.generation}`;
+
+    const selfLink = EmulatorRegistry.url(Emulators.STORAGE);
+    selfLink.pathname = `/storage/v1/b/${metadata.bucket}/o/${encodeURIComponent(metadata.name)}`;
+    this.selfLink = selfLink.toString();
+
+    const mediaLink = EmulatorRegistry.url(Emulators.STORAGE);
+    mediaLink.pathname = `/download/storage/v1/b/${metadata.bucket}/o/${encodeURIComponent(
+      metadata.name,
+    )}`;
+    mediaLink.searchParams.set("generation", metadata.generation.toString());
+    mediaLink.searchParams.set("alt", "media");
+
+    this.mediaLink = mediaLink.toString();
   }
 }
 
@@ -455,16 +505,17 @@ export class CloudStorageObjectMetadata {
  * @return the formatted date.
  */
 export function toSerializedDate(d: Date): string {
-  const day = `${d.getFullYear()}-${(d.getMonth() + 1)
+  const day = `${d.getUTCFullYear()}-${(d.getUTCMonth() + 1).toString().padStart(2, "0")}-${d
+    .getUTCDate()
     .toString()
-    .padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")}`;
-  const time = `${d.getHours().toString().padStart(2, "0")}:${d
-    .getMinutes()
+    .padStart(2, "0")}`;
+  const time = `${d.getUTCHours().toString().padStart(2, "0")}:${d
+    .getUTCMinutes()
     .toString()
-    .padStart(2, "0")}:${d
-    .getSeconds()
+    .padStart(2, "0")}:${d.getUTCSeconds().toString().padStart(2, "0")}.${d
+    .getUTCMilliseconds()
     .toString()
-    .padStart(2, "0")}.${d.getMilliseconds().toString().padStart(3, "0")}`;
+    .padStart(3, "0")}`;
   return `${day}T${time}Z`;
 }
 
@@ -472,4 +523,11 @@ function generateMd5Hash(bytes: Buffer): string {
   const hash = crypto.createHash("md5");
   hash.update(bytes);
   return hash.digest("base64");
+}
+
+function generateETag(generation: number, metadatageneration: number): string {
+  const hash = crypto.createHash("sha1");
+  hash.update(`${generation}/${metadatageneration}`);
+  // Trim padding
+  return hash.digest("base64").slice(0, -1);
 }

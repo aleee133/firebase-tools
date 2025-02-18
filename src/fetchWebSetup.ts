@@ -33,9 +33,9 @@ interface ListSitesResponse {
   nextPageToken: string;
 }
 
-const apiClient = new Client({ urlPrefix: firebaseApiOrigin, auth: true, apiVersion: "v1beta1" });
+const apiClient = new Client({ urlPrefix: firebaseApiOrigin(), auth: true, apiVersion: "v1beta1" });
 const hostingApiClient = new Client({
-  urlPrefix: hostingApiOrigin,
+  urlPrefix: hostingApiOrigin(),
   auth: true,
   apiVersion: "v1beta1",
 });
@@ -80,7 +80,7 @@ async function listAllSites(projectId: string, nextPageToken?: string): Promise<
 /**
  * Construct a fake configuration based on the project ID.
  */
-function constructDefaultWebSetup(projectId: string): WebConfig {
+export function constructDefaultWebSetup(projectId: string): WebConfig {
   return {
     projectId,
     databaseURL: `https://${projectId}.firebaseio.com`,
@@ -111,7 +111,7 @@ export async function fetchWebSetup(options: any): Promise<WebConfig> {
     if (defaultSite && defaultSite.appId) {
       hostingAppId = defaultSite.appId;
     }
-  } catch (e) {
+  } catch (e: any) {
     logger.debug("Failed to list hosting sites");
     logger.debug(e);
   }

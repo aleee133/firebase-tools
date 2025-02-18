@@ -1,10 +1,11 @@
-import * as _ from "lodash";
-
-import * as api from "../api";
+import { rulesOrigin } from "../api";
+import { Client } from "../apiv2";
 import { logger } from "../logger";
 import * as utils from "../utils";
 
 const API_VERSION = "v1";
+
+const apiClient = new Client({ urlPrefix: rulesOrigin(), apiVersion: API_VERSION });
 
 function _handleErrorResponse(response: any): any {
   if (response.body && response.body.error) {
@@ -21,15 +22,15 @@ function _handleErrorResponse(response: any): any {
  * Gets the latest ruleset name on the project.
  * @param projectId Project from which you want to get the ruleset.
  * @param service Service for the ruleset (ex: cloud.firestore or firebase.storage).
- * @returns Name of the latest ruleset.
+ * @return Name of the latest ruleset.
  */
 export async function getLatestRulesetName(
   projectId: string,
-  service: string
+  service: string,
 ): Promise<string | null> {
   const releases = await listAllReleases(projectId);
   const prefix = `projects/${projectId}/releases/${service}`;
-  const release = _.find(releases, (r) => r.name.indexOf(prefix) === 0);
+  const release = releases.find((r) => r.name.startsWith(prefix));
 
   if (!release) {
     return null;
@@ -44,12 +45,10 @@ const MAX_RELEASES_PAGE_SIZE = 10;
  */
 export async function listReleases(
   projectId: string,
-  pageToken?: string
+  pageToken = "",
 ): Promise<ListReleasesResponse> {
-  const response = await api.request("GET", `/${API_VERSION}/projects/${projectId}/releases`, {
-    auth: true,
-    origin: api.rulesOrigin,
-    query: {
+  const response = await apiClient.get<ListReleasesResponse>(`/projects/${projectId}/releases`, {
+    queryParams: {
       pageSize: MAX_RELEASES_PAGE_SIZE,
       pageToken,
     },
@@ -87,7 +86,7 @@ export async function listAllReleases(projectId: string): Promise<Release[]> {
     }
     pageToken = response.nextPageToken;
   } while (pageToken);
-  return _.orderBy(releases, ["createTime"], ["desc"]);
+  return releases.sort((a, b) => b.createTime.localeCompare(a.createTime));
 }
 
 export interface RulesetFile {
@@ -105,12 +104,11 @@ export interface RulesetSource {
  * @return Array of files in the ruleset. Each entry has form { content, name }.
  */
 export async function getRulesetContent(name: string): Promise<RulesetFile[]> {
-  const response = await api.request("GET", `/${API_VERSION}/${name}`, {
-    auth: true,
-    origin: api.rulesOrigin,
+  const response = await apiClient.get<{ source: RulesetSource }>(`/${name}`, {
+    skipLog: { resBody: true },
   });
   if (response.status === 200) {
-    const source: RulesetSource = response.body.source;
+    const source = response.body.source;
     return source.files;
   }
 
@@ -124,15 +122,14 @@ const MAX_RULESET_PAGE_SIZE = 100;
  */
 export async function listRulesets(
   projectId: string,
-  pageToken?: string
+  pageToken: string = "",
 ): Promise<ListRulesetsResponse> {
-  const response = await api.request("GET", `/${API_VERSION}/projects/${projectId}/rulesets`, {
-    auth: true,
-    origin: api.rulesOrigin,
-    query: {
+  const response = await apiClient.get<ListRulesetsResponse>(`/projects/${projectId}/rulesets`, {
+    queryParams: {
       pageSize: MAX_RULESET_PAGE_SIZE,
       pageToken,
     },
+    skipLog: { resBody: true },
   });
   if (response.status === 200) {
     return response.body;
@@ -155,7 +152,7 @@ export async function listAllRulesets(projectId: string): Promise<ListRulesetsEn
     }
     pageToken = response.nextPageToken;
   } while (pageToken);
-  return _.orderBy(rulesets, ["createTime"], ["desc"]);
+  return rulesets.sort((a, b) => b.createTime.localeCompare(a.createTime));
 }
 
 export interface ListRulesetsResponse {
@@ -178,14 +175,7 @@ export function getRulesetId(ruleset: ListRulesetsEntry): string {
  * by a release, the operation will fail.
  */
 export async function deleteRuleset(projectId: string, id: string): Promise<void> {
-  const response = await api.request(
-    "DELETE",
-    `/${API_VERSION}/projects/${projectId}/rulesets/${id}`,
-    {
-      auth: true,
-      origin: api.rulesOrigin,
-    }
-  );
+  const response = await apiClient.delete(`/projects/${projectId}/rulesets/${id}`);
   if (response.status === 200) {
     return;
   }
@@ -200,11 +190,11 @@ export async function deleteRuleset(projectId: string, id: string): Promise<void
 export async function createRuleset(projectId: string, files: RulesetFile[]): Promise<string> {
   const payload = { source: { files } };
 
-  const response = await api.request("POST", `/${API_VERSION}/projects/${projectId}/rulesets`, {
-    auth: true,
-    data: payload,
-    origin: api.rulesOrigin,
-  });
+  const response = await apiClient.post<unknown, { name: string }>(
+    `/projects/${projectId}/rulesets`,
+    payload,
+    { skipLog: { body: true } },
+  );
   if (response.status === 200) {
     logger.debug("[rules] created ruleset", response.body.name);
     return response.body.name;
@@ -222,18 +212,17 @@ export async function createRuleset(projectId: string, files: RulesetFile[]): Pr
 export async function createRelease(
   projectId: string,
   rulesetName: string,
-  releaseName: string
+  releaseName: string,
 ): Promise<string> {
   const payload = {
     name: `projects/${projectId}/releases/${releaseName}`,
     rulesetName,
   };
 
-  const response = await api.request("POST", `/${API_VERSION}/projects/${projectId}/releases`, {
-    auth: true,
-    data: payload,
-    origin: api.rulesOrigin,
-  });
+  const response = await apiClient.post<unknown, { name: string }>(
+    `/projects/${projectId}/releases`,
+    payload,
+  );
   if (response.status === 200) {
     logger.debug("[rules] created release", response.body.name);
     return response.body.name;
@@ -251,7 +240,7 @@ export async function createRelease(
 export async function updateRelease(
   projectId: string,
   rulesetName: string,
-  releaseName: string
+  releaseName: string,
 ): Promise<string> {
   const payload = {
     release: {
@@ -260,14 +249,9 @@ export async function updateRelease(
     },
   };
 
-  const response = await api.request(
-    "PATCH",
-    `/${API_VERSION}/projects/${projectId}/releases/${releaseName}`,
-    {
-      auth: true,
-      data: payload,
-      origin: api.rulesOrigin,
-    }
+  const response = await apiClient.patch<unknown, { name: string }>(
+    `/projects/${projectId}/releases/${releaseName}`,
+    payload,
   );
   if (response.status === 200) {
     logger.debug("[rules] updated release", response.body.name);
@@ -280,7 +264,7 @@ export async function updateRelease(
 export async function updateOrCreateRelease(
   projectId: string,
   rulesetName: string,
-  releaseName: string
+  releaseName: string,
 ): Promise<string> {
   logger.debug("[rules] releasing", releaseName, "with ruleset", rulesetName);
   return updateRelease(projectId, rulesetName, releaseName).catch(() => {
@@ -290,11 +274,9 @@ export async function updateOrCreateRelease(
 }
 
 export function testRuleset(projectId: string, files: RulesetFile[]): Promise<any> {
-  return api.request("POST", `/${API_VERSION}/projects/${encodeURIComponent(projectId)}:test`, {
-    origin: api.rulesOrigin,
-    data: {
-      source: { files },
-    },
-    auth: true,
-  });
+  return apiClient.post(
+    `/projects/${encodeURIComponent(projectId)}:test`,
+    { source: { files } },
+    { skipLog: { body: true } },
+  );
 }

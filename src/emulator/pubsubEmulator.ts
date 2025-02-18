@@ -11,6 +11,14 @@ import { FirebaseError } from "../error";
 import { EmulatorRegistry } from "./registry";
 import { SignatureType } from "./functionsEmulatorShared";
 import { CloudEvent } from "./events/types";
+import { execSync } from "child_process";
+
+// Finds processes with "pubsub-emulator" in the description and runs `kill` if any exist
+// Since the pubsub emulator doesn't export any data, force-killing will not affect export-on-exit
+// Note the `[p]` is a workaround to avoid selecting the currently running `ps` process.
+const PUBSUB_KILL_COMMAND =
+  "pubsub_pids=$(ps aux | grep '[p]ubsub-emulator' | awk '{print $2}');" +
+  " if [ ! -z '$pubsub_pids' ]; then kill -9 $pubsub_pids; fi;";
 
 export interface PubsubEmulatorArgs {
   projectId: string;
@@ -25,7 +33,7 @@ interface Trigger {
 }
 
 export class PubsubEmulator implements EmulatorInstance {
-  pubsub: PubSub;
+  private _pubsub: PubSub | undefined;
 
   // Map of topic name to a list of functions to trigger
   triggersForTopic: Map<string, Trigger[]>;
@@ -38,12 +46,17 @@ export class PubsubEmulator implements EmulatorInstance {
 
   private logger = EmulatorLogger.forEmulator(Emulators.PUBSUB);
 
+  get pubsub(): PubSub {
+    if (!this._pubsub) {
+      this._pubsub = new PubSub({
+        apiEndpoint: EmulatorRegistry.url(Emulators.PUBSUB).host,
+        projectId: this.args.projectId,
+      });
+    }
+    return this._pubsub;
+  }
+
   constructor(private args: PubsubEmulatorArgs) {
-    const { host, port } = this.getInfo();
-    this.pubsub = new PubSub({
-      apiEndpoint: `${host}:${port}`,
-      projectId: this.args.projectId,
-    });
     this.triggersForTopic = new Map();
     this.subscriptionForTopic = new Map();
   }
@@ -57,11 +70,19 @@ export class PubsubEmulator implements EmulatorInstance {
   }
 
   async stop(): Promise<void> {
-    await downloadableEmulators.stop(Emulators.PUBSUB);
+    try {
+      await downloadableEmulators.stop(Emulators.PUBSUB);
+    } catch (e: unknown) {
+      this.logger.logLabeled("DEBUG", "pubsub", JSON.stringify(e));
+      if (process.platform !== "win32") {
+        const buffer = execSync(PUBSUB_KILL_COMMAND);
+        this.logger.logLabeled("DEBUG", "pubsub", "Pubsub kill output: " + JSON.stringify(buffer));
+      }
+    }
   }
 
   getInfo(): EmulatorInfo {
-    const host = this.args.host || Constants.getDefaultHost(Emulators.PUBSUB);
+    const host = this.args.host || Constants.getDefaultHost();
     const port = this.args.port || Constants.getDefaultPort(Emulators.PUBSUB);
 
     return {
@@ -76,12 +97,50 @@ export class PubsubEmulator implements EmulatorInstance {
     return Emulators.PUBSUB;
   }
 
+  private async maybeCreateTopicAndSub(topicName: string): Promise<Subscription> {
+    const topic = this.pubsub.topic(topicName);
+    try {
+      this.logger.logLabeled("DEBUG", "pubsub", `Creating topic: ${topicName}`);
+      await topic.create();
+    } catch (e: any) {
+      // CODE 6: ALREADY EXISTS. Carry on.
+      if (e && e.code === 6) {
+        this.logger.logLabeled("DEBUG", "pubsub", `Topic ${topicName} exists`);
+      } else {
+        throw new FirebaseError(`Could not create topic ${topicName}`, { original: e });
+      }
+    }
+
+    const subName = `emulator-sub-${topicName}`;
+    let sub: Subscription;
+    try {
+      this.logger.logLabeled("DEBUG", "pubsub", `Creating sub for topic: ${topicName}`);
+      [sub] = await topic.createSubscription(subName);
+    } catch (e: any) {
+      if (e && e.code === 6) {
+        // CODE 6: ALREADY EXISTS. Carry on.
+        this.logger.logLabeled("DEBUG", "pubsub", `Sub for ${topicName} exists`);
+        sub = topic.subscription(subName);
+      } else {
+        throw new FirebaseError(`Could not create sub ${subName}`, { original: e });
+      }
+    }
+
+    sub.on("message", (message: Message) => {
+      this.onMessage(topicName, message);
+    });
+
+    return sub;
+  }
+
   async addTrigger(topicName: string, triggerKey: string, signatureType: SignatureType) {
     this.logger.logLabeled(
       "DEBUG",
       "pubsub",
-      `addTrigger(${topicName}, ${triggerKey}, ${signatureType})`
+      `addTrigger(${topicName}, ${triggerKey}, ${signatureType})`,
     );
+
+    const sub = await this.maybeCreateTopicAndSub(topicName);
 
     const triggers = this.triggersForTopic.get(topicName) || [];
     if (
@@ -92,54 +151,20 @@ export class PubsubEmulator implements EmulatorInstance {
       return;
     }
 
-    const topic = this.pubsub.topic(topicName);
-    try {
-      this.logger.logLabeled("DEBUG", "pubsub", `Creating topic: ${topicName}`);
-      await topic.create();
-    } catch (e) {
-      if (e && e.code === 6) {
-        this.logger.logLabeled("DEBUG", "pubsub", `Topic ${topicName} exists`);
-      } else {
-        throw new FirebaseError(`Could not create topic ${topicName}`, { original: e });
-      }
-    }
-
-    const subName = `emulator-sub-${topicName}`;
-    let sub;
-    try {
-      this.logger.logLabeled("DEBUG", "pubsub", `Creating sub for topic: ${topicName}`);
-      [sub] = await topic.createSubscription(subName);
-    } catch (e) {
-      if (e && e.code === 6) {
-        this.logger.logLabeled("DEBUG", "pubsub", `Sub for ${topicName} exists`);
-        sub = topic.subscription(`emulator-sub-${topicName}`);
-      } else {
-        throw new FirebaseError(`Could not create sub ${subName}`, { original: e });
-      }
-    }
-
-    sub.on("message", (message: Message) => {
-      this.onMessage(topicName, message);
-    });
-
     triggers.push({ triggerKey, signatureType });
     this.triggersForTopic.set(topicName, triggers);
     this.subscriptionForTopic.set(topicName, sub);
   }
 
   private ensureFunctionsClient() {
-    if (this.client != undefined) return;
+    if (this.client !== undefined) return;
 
-    const funcEmulator = EmulatorRegistry.get(Emulators.FUNCTIONS);
-    if (!funcEmulator) {
+    if (!EmulatorRegistry.isRunning(Emulators.FUNCTIONS)) {
       throw new FirebaseError(
-        `Attempted to execute pubsub trigger but could not find the Functions emulator`
+        `Attempted to execute pubsub trigger but could not find the Functions emulator`,
       );
     }
-    this.client = new Client({
-      urlPrefix: `http://${EmulatorRegistry.getInfoHostString(funcEmulator.getInfo())}`,
-      auth: false,
-    });
+    this.client = EmulatorRegistry.client(Emulators.FUNCTIONS);
   }
 
   private createLegacyEventRequestBody(topic: string, message: Message) {
@@ -162,22 +187,31 @@ export class PubsubEmulator implements EmulatorInstance {
 
   private createCloudEventRequestBody(
     topic: string,
-    message: Message
+    message: Message,
   ): CloudEvent<MessagePublishedData> {
+    // Pubsub events from Pubsub Emulator include a date with nanoseconds.
+    // Prod Pubsub doesn't publish timestamp at that level of precision. Timestamp with nanosecond precision also
+    // are difficult to parse in languages other than Node.js (e.g. python).
+    const truncatedPublishTime = new Date(message.publishTime.getTime()).toISOString();
     const data: MessagePublishedData = {
       message: {
         messageId: message.id,
-        publishTime: message.publishTime,
+        publishTime: truncatedPublishTime,
         attributes: message.attributes,
         orderingKey: message.orderingKey,
         data: message.data.toString("base64"),
-      },
+
+        // NOTE: We include camel_cased attributes since they also available and depended on by other runtimes
+        // like python.
+        message_id: message.id,
+        publish_time: truncatedPublishTime,
+      } as MessagePublishedData["message"],
       subscription: this.subscriptionForTopic.get(topic)!.name,
     };
     return {
-      specversion: "1",
+      specversion: "1.0",
       id: uuid.v4(),
-      time: message.publishTime.toISOString(),
+      time: truncatedPublishTime,
       type: "google.cloud.pubsub.topic.v1.messagePublished",
       source: `//pubsub.googleapis.com/projects/${this.args.projectId}/topics/${topic}`,
       data,
@@ -195,8 +229,8 @@ export class PubsubEmulator implements EmulatorInstance {
       "DEBUG",
       "pubsub",
       `Executing ${triggers.length} matching triggers (${JSON.stringify(
-        triggers.map((t) => t.triggerKey)
-      )})`
+        triggers.map((t) => t.triggerKey),
+      )})`,
     );
 
     this.ensureFunctionsClient();
@@ -210,12 +244,12 @@ export class PubsubEmulator implements EmulatorInstance {
           await this.client!.post<CloudEvent<MessagePublishedData>, unknown>(
             path,
             this.createCloudEventRequestBody(topicName, message),
-            { headers: { "Content-Type": "application/cloudevents+json; charset=UTF-8" } }
+            { headers: { "Content-Type": "application/cloudevents+json; charset=UTF-8" } },
           );
         } else {
           throw new FirebaseError(`Unsupported trigger signature: ${signatureType}`);
         }
-      } catch (e) {
+      } catch (e: any) {
         this.logger.logLabeled("DEBUG", "pubsub", e);
       }
     }

@@ -2,11 +2,11 @@ import * as crypto from "crypto";
 import * as fs from "fs-extra";
 import * as path from "path";
 import * as tmp from "tmp";
-import * as unzipper from "unzipper";
 
 import { EmulatorLogger } from "./emulatorLogger";
 import { EmulatorDownloadDetails, DownloadableEmulators } from "./types";
 import { FirebaseError } from "../error";
+import { unzip } from "../unzip";
 import * as downloadableEmulators from "./downloadableEmulators";
 import * as downloadUtils from "../downloadUtils";
 
@@ -14,14 +14,22 @@ tmp.setGracefulCleanup();
 
 export async function downloadEmulator(name: DownloadableEmulators): Promise<void> {
   const emulator = downloadableEmulators.getDownloadDetails(name);
+  if (emulator.localOnly) {
+    EmulatorLogger.forEmulator(name).logLabeled(
+      "WARN",
+      name,
+      `Env variable override detected, skipping download. Using ${emulator} emulator at ${emulator.binaryPath}`,
+    );
+    return;
+  }
   EmulatorLogger.forEmulator(name).logLabeled(
     "BULLET",
     name,
-    `downloading ${path.basename(emulator.downloadPath)}...`
+    `downloading ${path.basename(emulator.downloadPath)}...`,
   );
   fs.ensureDirSync(emulator.opts.cacheDir);
 
-  const tmpfile = await downloadUtils.downloadToTmp(emulator.opts.remoteUrl);
+  const tmpfile = await downloadUtils.downloadToTmp(emulator.opts.remoteUrl, !!emulator.opts.auth);
 
   if (!emulator.opts.skipChecksumAndSize) {
     await validateSize(tmpfile, emulator.opts.expectedSize);
@@ -43,19 +51,41 @@ export async function downloadEmulator(name: DownloadableEmulators): Promise<voi
   removeOldFiles(name, emulator);
 }
 
-function unzip(zipPath: string, unzipDir: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    fs.createReadStream(zipPath)
-      .pipe(unzipper.Extract({ path: unzipDir })) // eslint-disable-line new-cap
-      .on("error", reject)
-      .on("finish", resolve);
-  });
+export async function downloadExtensionVersion(
+  extensionVersionRef: string,
+  sourceDownloadUri: string,
+  targetDir: string,
+): Promise<void> {
+  const emulatorLogger = EmulatorLogger.forExtension({ ref: extensionVersionRef });
+  emulatorLogger.logLabeled(
+    "BULLET",
+    "extensions",
+    `Starting download for ${extensionVersionRef} source code to ${targetDir}..`,
+  );
+  try {
+    fs.mkdirSync(targetDir);
+  } catch (err) {
+    emulatorLogger.logLabeled(
+      "BULLET",
+      "extensions",
+      `cache directory for ${extensionVersionRef} already exists...`,
+    );
+  }
+  emulatorLogger.logLabeled("BULLET", "extensions", `downloading ${sourceDownloadUri}...`);
+  const sourceCodeZip = await downloadUtils.downloadToTmp(sourceDownloadUri);
+  await unzip(sourceCodeZip, targetDir);
+  fs.chmodSync(targetDir, 0o755);
+
+  emulatorLogger.logLabeled("BULLET", "extensions", `Downloaded to ${targetDir}...`);
+  // TODO: We should not need to do this wait
+  // However, when I remove this, unzipDir doesn't contain everything yet.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 }
 
 function removeOldFiles(
   name: DownloadableEmulators,
   emulator: EmulatorDownloadDetails,
-  removeAllVersions = false
+  removeAllVersions = false,
 ): void {
   const currentLocalPath = emulator.downloadPath;
   const currentUnzipPath = emulator.unzipDir;
@@ -77,7 +107,7 @@ function removeOldFiles(
       EmulatorLogger.forEmulator(name).logLabeled(
         "BULLET",
         name,
-        `Removing outdated emulator files: ${file}`
+        `Removing outdated emulator files: ${file}`,
       );
       fs.removeSync(fullFilePath);
     }
@@ -95,8 +125,8 @@ function validateSize(filepath: string, expectedSize: number): Promise<void> {
       : reject(
           new FirebaseError(
             `download failed, expected ${expectedSize} bytes but got ${stat.size}`,
-            { exit: 1 }
-          )
+            { exit: 1 },
+          ),
         );
   });
 }
@@ -116,8 +146,8 @@ function validateChecksum(filepath: string, expectedChecksum: string): Promise<v
         : reject(
             new FirebaseError(
               `download failed, expected checksum ${expectedChecksum} but got ${checksum}`,
-              { exit: 1 }
-            )
+              { exit: 1 },
+            ),
           );
     });
   });

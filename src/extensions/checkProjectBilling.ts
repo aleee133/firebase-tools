@@ -1,4 +1,4 @@
-import * as clc from "cli-color";
+import * as clc from "colorette";
 import * as opn from "open";
 
 import * as cloudbilling from "../gcp/cloudbilling";
@@ -16,8 +16,8 @@ function logBillingStatus(enabled: boolean, projectId: string): void {
   if (!enabled) {
     throw new FirebaseError(
       `${logPrefix}: ${clc.bold(
-        projectId
-      )} could not be upgraded. Please add a billing account via the Firebase console before proceeding.`
+        projectId,
+      )} could not be upgraded. Please add a billing account via the Firebase console before proceeding.`,
     );
   }
   utils.logLabeledSuccess(logPrefix, `${clc.bold(projectId)} has successfully been upgraded.`);
@@ -30,7 +30,7 @@ async function openBillingAccount(projectId: string, url: string, open: boolean)
   if (open) {
     try {
       opn(url);
-    } catch (err) {
+    } catch (err: any) {
       logger.debug("Unable to open billing URL: " + err.stack);
     }
   }
@@ -50,7 +50,7 @@ async function openBillingAccount(projectId: string, url: string, open: boolean)
  */
 async function chooseBillingAccount(
   projectId: string,
-  accounts: cloudbilling.BillingAccount[]
+  accounts: cloudbilling.BillingAccount[],
 ): Promise<void> {
   const choices = accounts.map((m) => m.displayName);
   choices.push(ADD_BILLING_ACCOUNT);
@@ -68,7 +68,7 @@ Please select the one that you would like to associate with this project:`,
     const billingURL = `https://console.cloud.google.com/billing/linkedaccount?project=${projectId}`;
     billingEnabled = await openBillingAccount(projectId, billingURL, true);
   } else {
-    const billingAccount = accounts.find((a) => a.displayName == answer);
+    const billingAccount = accounts.find((a) => a.displayName === answer);
     billingEnabled = await cloudbilling.setBillingAccount(projectId, billingAccount!.name);
   }
 
@@ -84,10 +84,10 @@ async function setUpBillingAccount(projectId: string) {
 
   logger.info();
   logger.info(
-    `Extension require your project to be upgraded to the Blaze plan. Please visit the following link to add a billing account:`
+    `Extension require your project to be upgraded to the Blaze plan. Please visit the following link to add a billing account:`,
   );
   logger.info();
-  logger.info(clc.bold.underline(billingURL));
+  logger.info(clc.bold(clc.underline(billingURL)));
   logger.info();
 
   const open = await prompt.promptOnce({

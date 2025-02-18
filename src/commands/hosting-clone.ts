@@ -1,4 +1,4 @@
-import { bold } from "cli-color";
+import { bold } from "colorette";
 import * as ora from "ora";
 
 import { Command } from "../command";
@@ -13,11 +13,17 @@ import {
 } from "../hosting/api";
 import * as utils from "../utils";
 import { requireAuth } from "../requireAuth";
-import * as marked from "marked";
 import { logger } from "../logger";
 
-export default new Command("hosting:clone <source> <targetChannel>")
+export const command = new Command("hosting:clone <source> <targetChannel>")
   .description("clone a version from one site to another")
+  .help(
+    `<source> and <targetChannel> accept the following format: <siteId>:<channelId>
+
+For example, to copy the content for a site \`my-site\` from a preview channel \`staging\` to a \`live\` channel, the command would look be:
+
+  firebase hosting:clone my-site:foo my-site:live`,
+  )
   .before(requireAuth)
   .action(async (source = "", targetChannel = "") => {
     // sites/{site}/versions/{version}
@@ -29,14 +35,14 @@ export default new Command("hosting:clone <source> <targetChannel>")
       [sourceSiteId, sourceVersion] = source.split("@");
       if (!sourceSiteId || !sourceVersion) {
         throw new FirebaseError(
-          `"${source}" is not a valid source. Must be in the form "<site>:<channel>" or "<site>@<version>"`
+          `"${source}" is not a valid source. Must be in the form "<site>:<channel>" or "<site>@<version>"`,
         );
       }
       sourceVersionName = `sites/${sourceSiteId}/versions/${sourceVersion}`;
     }
     if (!targetSiteId || !targetChannelId) {
       throw new FirebaseError(
-        `"${targetChannel}" is not a valid target channel. Must be in the form "<site>:<channel>" (to clone to the active website, use "live" as the channel).`
+        `"${targetChannel}" is not a valid target channel. Must be in the form "<site>:<channel>" (to clone to the active website, use "live" as the channel).`,
       );
     }
 
@@ -45,11 +51,11 @@ export default new Command("hosting:clone <source> <targetChannel>")
       sourceChannelId = normalizeName(sourceChannelId);
     }
 
-    const equalSiteIds = sourceSiteId == targetSiteId;
-    const equalChannelIds = sourceChannelId == targetChannelId;
+    const equalSiteIds = sourceSiteId === targetSiteId;
+    const equalChannelIds = sourceChannelId === targetChannelId;
     if (equalSiteIds && equalChannelIds) {
       throw new FirebaseError(
-        `Source and destination cannot be equal. Please pick a different source or desination.`
+        `Source and destination cannot be equal. Please pick a different source or desination.`,
       );
     }
 
@@ -58,15 +64,15 @@ export default new Command("hosting:clone <source> <targetChannel>")
       const sChannel = await getChannel("-", sourceSiteId, sourceChannelId);
       if (!sChannel) {
         throw new FirebaseError(
-          `Could not find the channel ${bold(sourceChannelId)} for site ${bold(sourceSiteId)}.`
+          `Could not find the channel ${bold(sourceChannelId)} for site ${bold(sourceSiteId)}.`,
         );
       }
       sourceVersionName = sChannel.release?.version?.name;
       if (!sourceVersionName) {
         throw new FirebaseError(
           `Could not find a version on the channel ${bold(sourceChannelId)} for site ${bold(
-            sourceSiteId
-          )}.`
+            sourceSiteId,
+          )}.`,
         );
       }
     }
@@ -75,41 +81,39 @@ export default new Command("hosting:clone <source> <targetChannel>")
     if (!tChannel) {
       utils.logBullet(
         `could not find channel ${bold(targetChannelId)} in site ${bold(
-          targetSiteId
-        )}, creating it...`
+          targetSiteId,
+        )}, creating it...`,
       );
       try {
         tChannel = await createChannel("-", targetSiteId, targetChannelId);
-      } catch (e) {
+      } catch (e: any) {
         throw new FirebaseError(
           `Could not create the channel ${bold(targetChannelId)} for site ${bold(targetSiteId)}.`,
-          { original: e }
+          { original: e },
         );
       }
       utils.logSuccess(`Created new channel ${targetChannelId}`);
       try {
         const tProjectId = parseProjectId(tChannel.name);
         await addAuthDomains(tProjectId, [tChannel.url]);
-      } catch (e) {
+      } catch (e: any) {
         utils.logLabeledWarning(
           "hosting:clone",
-          marked(
-            `Unable to add channel domain to Firebase Auth. Visit the Firebase Console at ${utils.consoleUrl(
-              targetSiteId,
-              "/authentication/providers"
-            )}`
-          )
+          `Unable to add channel domain to Firebase Auth. Visit the Firebase Console at ${utils.consoleUrl(
+            targetSiteId,
+            "/authentication/providers",
+          )}`,
         );
         logger.debug("[hosting] unable to add auth domain", e);
       }
     }
     const currentTargetVersionName = tChannel.release?.version?.name;
 
-    if (equalSiteIds && sourceVersionName == currentTargetVersionName) {
+    if (equalSiteIds && sourceVersionName === currentTargetVersionName) {
       utils.logSuccess(
         `Channels ${bold(sourceChannelId)} and ${bold(
-          targetChannel
-        )} are serving identical versions. No need to clone.`
+          targetChannel,
+        )} are serving identical versions. No need to clone.`,
       );
       return;
     }
@@ -121,13 +125,13 @@ export default new Command("hosting:clone <source> <targetChannel>")
         const targetVersion = await cloneVersion(targetSiteId, sourceVersionName, true);
         if (!targetVersion) {
           throw new FirebaseError(
-            `Could not clone the version ${bold(sourceVersion)} for site ${bold(targetSiteId)}.`
+            `Could not clone the version ${bold(sourceVersion)} for site ${bold(targetSiteId)}.`,
           );
         }
         targetVersionName = targetVersion.name;
       }
       await createRelease(targetSiteId, targetChannelId, targetVersionName);
-    } catch (err) {
+    } catch (err: any) {
       spinner.fail();
       throw err;
     }
@@ -135,8 +139,8 @@ export default new Command("hosting:clone <source> <targetChannel>")
     spinner.succeed();
     utils.logSuccess(
       `Site ${bold(sourceSiteId)} ${sourceChannelId ? "channel" : "version"} ${bold(
-        sourceChannelId || sourceVersion
-      )} has been cloned to site ${bold(targetSiteId)} channel ${bold(targetChannelId)}.`
+        sourceChannelId || sourceVersion,
+      )} has been cloned to site ${bold(targetSiteId)} channel ${bold(targetChannelId)}.`,
     );
     utils.logSuccess(`Channel URL (${targetChannelId}): ${tChannel.url}`);
   });

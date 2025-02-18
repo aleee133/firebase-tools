@@ -17,7 +17,7 @@ export interface ModuleVersion {
 
 export function extractParamsFromPath(
   wildcardPath: string,
-  snapshotPath: string
+  snapshotPath: string,
 ): { [key: string]: string } {
   if (!isValidWildcardMatch(wildcardPath, snapshotPath)) {
     return {};
@@ -80,7 +80,7 @@ export function parseRuntimeVersion(runtime?: string): number | undefined {
   }
 
   const runtimeRe = /(nodejs)?([0-9]+)/;
-  const match = runtime.match(runtimeRe);
+  const match = runtimeRe.exec(runtime);
   if (match) {
     return Number.parseInt(match[2]);
   }
@@ -117,17 +117,24 @@ export function compareVersionStrings(a?: string, b?: string) {
   const versionA = parseVersionString(a);
   const versionB = parseVersionString(b);
 
-  if (versionA.major != versionB.major) {
+  if (versionA.major !== versionB.major) {
     return versionA.major - versionB.major;
   }
 
-  if (versionA.minor != versionB.minor) {
+  if (versionA.minor !== versionB.minor) {
     return versionA.minor - versionB.minor;
   }
 
-  if (versionA.patch != versionB.patch) {
+  if (versionA.patch !== versionB.patch) {
     return versionA.patch - versionB.patch;
   }
 
   return 0;
+}
+
+/**
+ * Check if a url is localhost
+ */
+export function isLocalHost(href: string): boolean {
+  return !!href.match(/^(http(s)?:\/\/)?(localhost|127.0.0.1|\[::1])/);
 }

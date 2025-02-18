@@ -1,18 +1,15 @@
-import clc = require("cli-color");
-import fs = require("fs");
+import * as clc from "colorette";
 
-import gcp = require("../../../gcp");
-import fsutils = require("../../../fsutils");
+import * as gcp from "../../../gcp";
+import * as fsutils from "../../../fsutils";
 import { prompt, promptOnce } from "../../../prompt";
 import { logger } from "../../../logger";
-import utils = require("../../../utils");
+import * as utils from "../../../utils";
+import { readTemplateSync } from "../../../templates";
 
 const DEFAULT_RULES_FILE = "firestore.rules";
 
-const RULES_TEMPLATE = fs.readFileSync(
-  __dirname + "/../../../../templates/init/firestore/firestore.rules",
-  "utf8"
-);
+const RULES_TEMPLATE = readTemplateSync("init/firestore/firestore.rules");
 
 export function initRules(setup: any, config: any): Promise<any> {
   logger.info();

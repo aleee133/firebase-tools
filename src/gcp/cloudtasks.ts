@@ -4,11 +4,12 @@ import { Client } from "../apiv2";
 import { cloudTasksOrigin } from "../api";
 import * as iam from "./iam";
 import * as backend from "../deploy/functions/backend";
+import { nullsafeVisitor } from "../functional";
 
 const API_VERSION = "v2";
 
 const client = new Client({
-  urlPrefix: cloudTasksOrigin,
+  urlPrefix: cloudTasksOrigin(),
   auth: true,
   apiVersion: API_VERSION,
 });
@@ -21,17 +22,16 @@ export interface AppEngineRouting {
 }
 
 export interface RateLimits {
-  maxDispatchesPerSecond?: number;
-  maxBurstSize?: number;
-  maxConcurrentDispatches?: number;
+  maxDispatchesPerSecond?: number | null;
+  maxConcurrentDispatches?: number | null;
 }
 
 export interface RetryConfig {
-  maxAttempts?: number;
-  maxRetryDuration?: proto.Duration;
-  minBackoff?: proto.Duration;
-  maxBackoff?: proto.Duration;
-  maxDoublings?: number;
+  maxAttempts?: number | null;
+  maxRetryDuration?: proto.Duration | null;
+  minBackoff?: proto.Duration | null;
+  maxBackoff?: proto.Duration | null;
+  maxDoublings?: number | null;
 }
 
 export interface StackdriverLoggingConfig {
@@ -69,7 +69,6 @@ export interface Queue {
 export const DEFAULT_SETTINGS: Omit<Queue, "name"> = {
   rateLimits: {
     maxConcurrentDispatches: 1000,
-    maxBurstSize: 100,
     maxDispatchesPerSecond: 500,
   },
   state: "RUNNING",
@@ -117,7 +116,7 @@ export async function upsertQueue(queue: Queue): Promise<boolean> {
 
     await (module.exports.updateQueue as typeof updateQueue)(queue);
     return false;
-  } catch (err) {
+  } catch (err: any) {
     if (err?.context?.response?.statusCode === 404) {
       await (module.exports.createQueue as typeof createQueue)(queue);
       return true;
@@ -156,7 +155,7 @@ const ENQUEUER_ROLE = "roles/cloudtasks.enqueuer";
 export async function setEnqueuer(
   name: string,
   invoker: string[],
-  assumeEmpty: boolean = false
+  assumeEmpty = false,
 ): Promise<void> {
   let existing: iam.Policy;
   if (assumeEmpty) {
@@ -173,7 +172,7 @@ export async function setEnqueuer(
   const invokerMembers = proto.getInvokerMembers(invoker, project);
   while (true) {
     const policy: iam.Policy = {
-      bindings: existing.bindings.filter((binding) => binding.role != ENQUEUER_ROLE),
+      bindings: existing.bindings.filter((binding) => binding.role !== ENQUEUER_ROLE),
       etag: existing.etag,
       version: existing.version,
     };
@@ -189,7 +188,7 @@ export async function setEnqueuer(
     try {
       await (module.exports.setIamPolicy as typeof setIamPolicy)(name, policy);
       return;
-    } catch (err) {
+    } catch (err: any) {
       // Re-fetch on conflict
       if (err?.context?.response?.statusCode === 429) {
         existing = await (module.exports.getIamPolicy as typeof getIamPolicy)(name);
@@ -202,7 +201,7 @@ export async function setEnqueuer(
 
 /** The name of the Task Queue we will use for this endpoint. */
 export function queueNameForEndpoint(
-  endpoint: backend.Endpoint & backend.TaskQueueTriggered
+  endpoint: backend.Endpoint & backend.TaskQueueTriggered,
 ): string {
   return `projects/${endpoint.project}/locations/${endpoint.region}/queues/${endpoint.id}`;
 }
@@ -217,9 +216,8 @@ export function queueFromEndpoint(endpoint: backend.Endpoint & backend.TaskQueue
     proto.copyIfPresent(
       queue.rateLimits,
       endpoint.taskQueueTrigger.rateLimits,
-      "maxBurstSize",
       "maxConcurrentDispatches",
-      "maxDispatchesPerSecond"
+      "maxDispatchesPerSecond",
     );
   }
   if (endpoint.taskQueueTrigger.retryConfig) {
@@ -227,11 +225,74 @@ export function queueFromEndpoint(endpoint: backend.Endpoint & backend.TaskQueue
       queue.retryConfig,
       endpoint.taskQueueTrigger.retryConfig,
       "maxAttempts",
-      "maxBackoff",
       "maxDoublings",
+    );
+    proto.convertIfPresent(
+      queue.retryConfig,
+      endpoint.taskQueueTrigger.retryConfig,
       "maxRetryDuration",
-      "minBackoff"
+      "maxRetrySeconds",
+      nullsafeVisitor(proto.durationFromSeconds),
+    );
+    proto.convertIfPresent(
+      queue.retryConfig,
+      endpoint.taskQueueTrigger.retryConfig,
+      "maxBackoff",
+      "maxBackoffSeconds",
+      nullsafeVisitor(proto.durationFromSeconds),
+    );
+    proto.convertIfPresent(
+      queue.retryConfig,
+      endpoint.taskQueueTrigger.retryConfig,
+      "minBackoff",
+      "minBackoffSeconds",
+      nullsafeVisitor(proto.durationFromSeconds),
     );
   }
   return queue;
+}
+
+/** Creates a trigger type from API type */
+export function triggerFromQueue(queue: Queue): backend.TaskQueueTriggered["taskQueueTrigger"] {
+  const taskQueueTrigger: backend.TaskQueueTriggered["taskQueueTrigger"] = {};
+  if (queue.rateLimits) {
+    taskQueueTrigger.rateLimits = {};
+    proto.copyIfPresent(
+      taskQueueTrigger.rateLimits,
+      queue.rateLimits,
+      "maxConcurrentDispatches",
+      "maxDispatchesPerSecond",
+    );
+  }
+  if (queue.retryConfig) {
+    taskQueueTrigger.retryConfig = {};
+    proto.copyIfPresent(
+      taskQueueTrigger.retryConfig,
+      queue.retryConfig,
+      "maxAttempts",
+      "maxDoublings",
+    );
+    proto.convertIfPresent(
+      taskQueueTrigger.retryConfig,
+      queue.retryConfig,
+      "maxRetrySeconds",
+      "maxRetryDuration",
+      nullsafeVisitor(proto.secondsFromDuration),
+    );
+    proto.convertIfPresent(
+      taskQueueTrigger.retryConfig,
+      queue.retryConfig,
+      "maxBackoffSeconds",
+      "maxBackoff",
+      nullsafeVisitor(proto.secondsFromDuration),
+    );
+    proto.convertIfPresent(
+      taskQueueTrigger.retryConfig,
+      queue.retryConfig,
+      "minBackoffSeconds",
+      "minBackoff",
+      nullsafeVisitor(proto.secondsFromDuration),
+    );
+  }
+  return taskQueueTrigger;
 }

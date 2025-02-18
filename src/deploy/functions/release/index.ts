@@ -1,4 +1,4 @@
-import * as clc from "cli-color";
+import * as clc from "colorette";
 
 import { Options } from "../../../options";
 import { logger } from "../../../logger";
@@ -11,86 +11,121 @@ import * as fabricator from "./fabricator";
 import * as reporter from "./reporter";
 import * as executor from "./executor";
 import * as prompts from "../prompts";
+import * as experiments from "../../../experiments";
 import { getAppEngineLocation } from "../../../functionsConfig";
 import { getFunctionLabel } from "../functionsDeployHelper";
 import { FirebaseError } from "../../../error";
+import { getProjectNumber } from "../../../getProjectNumber";
+import { release as extRelease } from "../../extensions";
 
-/** Releases new versions of functions to prod. */
+/** Releases new versions of functions and extensions to prod. */
 export async function release(
   context: args.Context,
   options: Options,
-  payload: args.Payload
+  payload: args.Payload,
 ): Promise<void> {
-  if (!options.config.has("functions")) {
+  // Release extensions if any
+  if (context.extensions && payload.extensions) {
+    await extRelease(context.extensions, options, payload.extensions);
+  }
+
+  if (!context.config) {
+    return;
+  }
+  if (!payload.functions) {
+    return;
+  }
+  if (!context.sources) {
     return;
   }
 
-  const plan = planner.createDeploymentPlan(
-    payload.functions!.backend,
-    await backend.existingBackend(context),
-    { filters: context.filters }
-  );
+  let plan: planner.DeploymentPlan = {};
+  for (const [codebase, { wantBackend, haveBackend }] of Object.entries(payload.functions)) {
+    plan = {
+      ...plan,
+      ...planner.createDeploymentPlan({
+        codebase,
+        wantBackend,
+        haveBackend,
+        filters: context.filters,
+      }),
+    };
+  }
 
   const fnsToDelete = Object.values(plan)
     .map((regionalChanges) => regionalChanges.endpointsToDelete)
     .reduce(reduceFlat, []);
-  const shouldDelete = await prompts.promptForFunctionDeletion(
-    fnsToDelete,
-    options.force,
-    options.nonInteractive
-  );
+  const shouldDelete = await prompts.promptForFunctionDeletion(fnsToDelete, options);
   if (!shouldDelete) {
     for (const change of Object.values(plan)) {
       change.endpointsToDelete = [];
     }
   }
 
-  const functionExecutor: executor.QueueExecutor = new executor.QueueExecutor({
+  const fnsToUpdate = Object.values(plan)
+    .map((regionalChanges) => regionalChanges.endpointsToUpdate)
+    .reduce(reduceFlat, []);
+  const fnsToUpdateSafe = await prompts.promptForUnsafeMigration(fnsToUpdate, options);
+  // Replace endpointsToUpdate in deployment plan with endpoints that are either safe
+  // to update or customers have confirmed they want to update unsafely
+  for (const key of Object.keys(plan)) {
+    plan[key].endpointsToUpdate = [];
+  }
+  for (const eu of fnsToUpdateSafe) {
+    const e = eu.endpoint;
+    const key = `${e.codebase || ""}-${e.region}-${e.availableMemoryMb || "default"}`;
+    plan[key].endpointsToUpdate.push(eu);
+  }
+
+  const throttlerOptions = {
     retries: 30,
     backoff: 20000,
     concurrency: 40,
-    maxBackoff: 40000,
-  });
+    maxBackoff: 100000,
+  };
 
   const fab = new fabricator.Fabricator({
-    functionExecutor,
-    executor: new executor.QueueExecutor({}),
-    sourceUrl: context.sourceUrl!,
-    storage: context.storage!,
+    functionExecutor: new executor.QueueExecutor(throttlerOptions),
+    executor: new executor.QueueExecutor(throttlerOptions),
+    sources: context.sources,
     appEngineLocation: getAppEngineLocation(context.firebaseConfig),
+    projectNumber: options.projectNumber || (await getProjectNumber(context.projectId)),
   });
 
   const summary = await fab.applyPlan(plan);
 
-  await reporter.logAndTrackDeployStats(summary);
+  await reporter.logAndTrackDeployStats(summary, context);
   reporter.printErrors(summary);
 
   // N.B. Fabricator::applyPlan updates the endpoints it deploys to include the
   // uri field. createDeploymentPlan copies endpoints by reference. Both of these
   // subtleties are so we can take out a round trip API call to get the latest
   // trigger URLs by calling existingBackend again.
-  printTriggerUrls(payload.functions!.backend);
+  const wantBackend = backend.merge(...Object.values(payload.functions).map((p) => p.wantBackend));
+  printTriggerUrls(wantBackend);
 
-  const haveEndpoints = backend.allEndpoints(payload.functions!.backend);
+  const haveEndpoints = backend.allEndpoints(wantBackend);
   const deletedEndpoints = Object.values(plan)
     .map((r) => r.endpointsToDelete)
     .reduce(reduceFlat, []);
-  const opts: { ar?: containerCleaner.ArtifactRegistryCleaner } = {};
-  if (!context.artifactRegistryEnabled) {
-    opts.ar = new containerCleaner.NoopArtifactRegistryCleaner();
+  if (experiments.isEnabled("automaticallydeletegcfartifacts")) {
+    await containerCleaner.cleanupBuildImages(haveEndpoints, deletedEndpoints);
   }
-  await containerCleaner.cleanupBuildImages(haveEndpoints, deletedEndpoints, opts);
 
   const allErrors = summary.results.filter((r) => r.error).map((r) => r.error) as Error[];
   if (allErrors.length) {
-    const opts = allErrors.length == 1 ? { original: allErrors[0] } : { children: allErrors };
+    const opts = allErrors.length === 1 ? { original: allErrors[0] } : { children: allErrors };
+    logger.debug("Functions deploy failed.");
+    for (const error of allErrors) {
+      logger.debug(JSON.stringify(error, null, 2));
+    }
     throw new FirebaseError("There was an error deploying functions", { ...opts, exit: 2 });
   }
 }
 
 /**
  * Prints the URLs of HTTPS functions.
- * Caller must eitehr force refresh the backend or assume the fabricator
+ * Caller must either force refresh the backend or assume the fabricator
  * has updated the URI of endpoints after deploy.
  */
 export function printTriggerUrls(results: backend.Backend): void {
@@ -101,7 +136,9 @@ export function printTriggerUrls(results: backend.Backend): void {
 
   for (const httpsFunc of httpsFunctions) {
     if (!httpsFunc.uri) {
-      logger.debug("Missing URI for HTTPS function in printTriggerUrls. This shouldn't happen");
+      logger.debug(
+        "Not printing URL for HTTPS function. Typically this means it didn't match a filter or we failed deployment",
+      );
       continue;
     }
     logger.info(clc.bold("Function URL"), `(${getFunctionLabel(httpsFunc)}):`, httpsFunc.uri);

@@ -1,7 +1,8 @@
 import { AbortSignal } from "abort-controller";
+import { URL, URLSearchParams } from "url";
 import { Readable } from "stream";
-import { parse, URLSearchParams } from "url";
-import * as ProxyAgent from "proxy-agent";
+import { ProxyAgent } from "proxy-agent";
+import * as retry from "retry";
 import AbortController from "abort-controller";
 import fetch, { HeadersInit, Response, RequestInit, Headers } from "node-fetch";
 import util from "util";
@@ -9,22 +10,44 @@ import util from "util";
 import * as auth from "./auth";
 import { FirebaseError } from "./error";
 import { logger } from "./logger";
-import * as responseToError from "./responseToError";
+import { responseToError } from "./responseToError";
+import * as FormData from "form-data";
 
 // Using import would require resolveJsonModule, which seems to break the
 // build/output format.
 const pkg = require("../package.json");
 const CLI_VERSION: string = pkg.version;
 
-export type HttpMethod = "GET" | "PUT" | "POST" | "DELETE" | "PATCH";
+export const STANDARD_HEADERS: Record<string, string> = {
+  Connection: "keep-alive",
+  "User-Agent": `FirebaseCLI/${CLI_VERSION}`,
+  "X-Client-Version": `FirebaseCLI/${CLI_VERSION}`,
+};
+
+const GOOG_QUOTA_USER_HEADER = "x-goog-quota-user";
+
+const GOOG_USER_PROJECT_HEADER = "x-goog-user-project";
+const GOOGLE_CLOUD_QUOTA_PROJECT = process.env.GOOGLE_CLOUD_QUOTA_PROJECT;
+
+export type HttpMethod =
+  | "GET"
+  | "PUT"
+  | "POST"
+  | "DELETE"
+  | "PATCH"
+  | "OPTIONS"
+  | "HEAD"
+  | "CONNECT"
+  | "TRACE";
 
 interface BaseRequestOptions<T> extends VerbOptions {
   method: HttpMethod;
   path: string;
   body?: T | string | NodeJS.ReadableStream;
-  responseType?: "json" | "stream";
+  responseType?: "json" | "xml" | "stream" | "arraybuffer" | "blob" | "text" | "unknown";
   redirect?: "error" | "follow" | "manual";
   compress?: boolean;
+  ignoreQuotaProject?: boolean;
 }
 
 interface RequestOptionsWithSignal<T> extends BaseRequestOptions<T> {
@@ -54,6 +77,14 @@ interface ClientHandlingOptions {
     resBody?: boolean;
   };
   resolveOnHTTPError?: boolean;
+  /** Codes on which to retry. Defaults to none. */
+  retryCodes?: number[];
+  /** Number of retries. Defaults to 0 (one attempt) with no retryCodes, 1 with retryCodes. */
+  retries?: number;
+  /** Minimum timeout between retries. Defaults to 1s. */
+  retryMinTimeout?: number;
+  /** Maximum timeout between retries. Defaults to 5s. */
+  retryMaxTimeout?: number;
 }
 
 export type ClientRequestOptions<T> = RequestOptions<T> & ClientVerbOptions;
@@ -91,6 +122,21 @@ export function setAccessToken(token = ""): void {
   accessToken = token;
 }
 
+/**
+ * Gets a singleton access token
+ * @returns An access token
+ */
+export async function getAccessToken(): Promise<string> {
+  const valid = auth.haveValidTokens(refreshToken, []);
+  const usingADC = !auth.loggedIn();
+  if (accessToken && (valid || usingADC)) {
+    return accessToken;
+  }
+
+  const data = await auth.getAccessToken(refreshToken, []);
+  return data.access_token;
+}
+
 function proxyURIFromEnv(): string | undefined {
   return (
     process.env.HTTPS_PROXY ||
@@ -105,7 +151,6 @@ export type ClientOptions = {
   urlPrefix: string;
   apiVersion?: string;
   auth?: boolean;
-  proxy?: string;
 };
 
 export class Client {
@@ -129,7 +174,7 @@ export class Client {
   post<ReqT, ResT>(
     path: string,
     json?: ReqT,
-    options: ClientVerbOptions = {}
+    options: ClientVerbOptions = {},
   ): Promise<ClientResponse<ResT>> {
     const reqOptions: ClientRequestOptions<ReqT> = Object.assign(options, {
       method: "POST",
@@ -142,7 +187,7 @@ export class Client {
   patch<ReqT, ResT>(
     path: string,
     json?: ReqT,
-    options: ClientVerbOptions = {}
+    options: ClientVerbOptions = {},
   ): Promise<ClientResponse<ResT>> {
     const reqOptions: ClientRequestOptions<ReqT> = Object.assign(options, {
       method: "PATCH",
@@ -155,7 +200,7 @@ export class Client {
   put<ReqT, ResT>(
     path: string,
     json?: ReqT,
-    options: ClientVerbOptions = {}
+    options: ClientVerbOptions = {},
   ): Promise<ClientResponse<ResT>> {
     const reqOptions: ClientRequestOptions<ReqT> = Object.assign(options, {
       method: "PUT",
@@ -173,6 +218,13 @@ export class Client {
     return this.request<unknown, ResT>(reqOptions);
   }
 
+  options<ResT>(path: string, options: ClientVerbOptions = {}): Promise<ClientResponse<ResT>> {
+    const reqOptions: ClientRequestOptions<unknown> = Object.assign(options, {
+      method: "OPTIONS",
+      path,
+    });
+    return this.request<unknown, ResT>(reqOptions);
+  }
   /**
    * Makes a request as specified by the options.
    * By default, this will:
@@ -201,7 +253,7 @@ export class Client {
     if (reqOptions.responseType === "stream" && !reqOptions.resolveOnHTTPError) {
       throw new FirebaseError(
         "apiv2 will not handle HTTP errors while streaming and you must set `resolveOnHTTPError` and check for res.status >= 400 on your own",
-        { exit: 2 }
+        { exit: 2 },
       );
     }
 
@@ -216,7 +268,7 @@ export class Client {
     }
     try {
       return await this.doRequest<ReqT, ResT>(internalReqOptions);
-    } catch (thrown) {
+    } catch (thrown: any) {
       if (thrown instanceof FirebaseError) {
         throw thrown;
       }
@@ -232,26 +284,33 @@ export class Client {
   }
 
   private addRequestHeaders<T>(
-    reqOptions: InternalClientRequestOptions<T>
+    reqOptions: InternalClientRequestOptions<T>,
   ): InternalClientRequestOptions<T> {
     if (!reqOptions.headers) {
       reqOptions.headers = new Headers();
     }
-    reqOptions.headers.set("Connection", "keep-alive");
-    if (!reqOptions.headers.has("User-Agent")) {
-      reqOptions.headers.set("User-Agent", `FirebaseCLI/${CLI_VERSION}`);
+    for (const [h, v] of Object.entries(STANDARD_HEADERS)) {
+      if (!reqOptions.headers.has(h)) {
+        reqOptions.headers.set(h, v);
+      }
     }
-    reqOptions.headers.set("X-Client-Version", `FirebaseCLI/${CLI_VERSION}`);
     if (!reqOptions.headers.has("Content-Type")) {
       if (reqOptions.responseType === "json") {
         reqOptions.headers.set("Content-Type", "application/json");
       }
     }
+    if (
+      !reqOptions.ignoreQuotaProject &&
+      GOOGLE_CLOUD_QUOTA_PROJECT &&
+      GOOGLE_CLOUD_QUOTA_PROJECT !== ""
+    ) {
+      reqOptions.headers.set(GOOG_USER_PROJECT_HEADER, GOOGLE_CLOUD_QUOTA_PROJECT);
+    }
     return reqOptions;
   }
 
   private async addAuthHeader<T>(
-    reqOptions: InternalClientRequestOptions<T>
+    reqOptions: InternalClientRequestOptions<T>,
   ): Promise<InternalClientRequestOptions<T>> {
     if (!reqOptions.headers) {
       reqOptions.headers = new Headers();
@@ -260,24 +319,10 @@ export class Client {
     if (isLocalInsecureRequest(this.opts.urlPrefix)) {
       token = "owner";
     } else {
-      token = await this.getAccessToken();
+      token = await getAccessToken();
     }
     reqOptions.headers.set("Authorization", `Bearer ${token}`);
     return reqOptions;
-  }
-
-  private async getAccessToken(): Promise<string> {
-    // Runtime fetch of Auth singleton to prevent circular module dependencies
-    if (accessToken) {
-      return accessToken;
-    }
-    // TODO: remove the as any once auth.js is migrated to auth.ts
-    interface AccessToken {
-      /* eslint-disable camelcase */
-      access_token: string;
-    }
-    const data = (await auth.getAccessToken(refreshToken, [])) as AccessToken;
-    return data.access_token;
   }
 
   private requestURL(options: InternalClientRequestOptions<unknown>): string {
@@ -286,7 +331,7 @@ export class Client {
   }
 
   private async doRequest<ReqT, ResT>(
-    options: InternalClientRequestOptions<ReqT>
+    options: InternalClientRequestOptions<ReqT>,
   ): Promise<ClientResponse<ResT>> {
     if (!options.path.startsWith("/")) {
       options.path = "/" + options.path;
@@ -315,12 +360,8 @@ export class Client {
       compress: options.compress,
     };
 
-    if (this.opts.proxy) {
-      fetchOptions.agent = new ProxyAgent(this.opts.proxy);
-    }
-    const envProxy = proxyURIFromEnv();
-    if (envProxy) {
-      fetchOptions.agent = new ProxyAgent(envProxy);
+    if (proxyURIFromEnv()) {
+      fetchOptions.agent = new ProxyAgent();
     }
 
     if (options.signal) {
@@ -342,57 +383,116 @@ export class Client {
       fetchOptions.body = JSON.stringify(options.body);
     }
 
-    this.logRequest(options);
-
-    let res: Response;
-    try {
-      res = await fetch(fetchURL, fetchOptions);
-    } catch (thrown) {
-      const err = thrown instanceof Error ? thrown : new Error(thrown);
-      const isAbortError = err.name.includes("AbortError");
-      if (isAbortError) {
-        throw new FirebaseError(`Timeout reached making request to ${fetchURL}`, { original: err });
-      }
-      throw new FirebaseError(`Failed to make request to ${fetchURL}`, { original: err });
-    } finally {
-      // If we succeed or failed, clear the timeout.
-      if (reqTimeout) {
-        clearTimeout(reqTimeout);
-      }
-    }
-
-    let body: ResT;
-    if (options.responseType === "json") {
-      const text = await res.text();
-      // Some responses, such as 204 and occasionally 202s don't have
-      // any content. We can't just rely on response code (202 may have conent)
-      // and unfortuantely res.length is unreliable (many requests return zero).
-      if (!text.length) {
-        body = (undefined as unknown) as ResT;
-      } else {
-        body = JSON.parse(text) as ResT;
-      }
-    } else if (options.responseType === "stream") {
-      body = (res.body as unknown) as ResT;
-    } else {
-      throw new FirebaseError(`Unable to interpret response. Please set responseType.`, {
-        exit: 2,
-      });
-    }
-
-    this.logResponse(res, body, options);
-
-    if (res.status >= 400) {
-      if (!options.resolveOnHTTPError) {
-        throw responseToError({ statusCode: res.status }, body);
-      }
-    }
-
-    return {
-      status: res.status,
-      response: res,
-      body,
+    // TODO(bkendall): Refactor this to use Throttler _or_ refactor Throttle to use `retry`.
+    const operationOptions: retry.OperationOptions = {
+      retries: options.retryCodes?.length ? 1 : 2,
+      minTimeout: 1 * 1000,
+      maxTimeout: 5 * 1000,
     };
+    if (typeof options.retries === "number") {
+      operationOptions.retries = options.retries;
+    }
+    if (typeof options.retryMinTimeout === "number") {
+      operationOptions.minTimeout = options.retryMinTimeout;
+    }
+    if (typeof options.retryMaxTimeout === "number") {
+      operationOptions.maxTimeout = options.retryMaxTimeout;
+    }
+    const operation = retry.operation(operationOptions);
+
+    return await new Promise<ClientResponse<ResT>>((resolve, reject) => {
+      // eslint-disable-next-line @typescript-eslint/no-misused-promises
+      operation.attempt(async (currentAttempt): Promise<void> => {
+        let res: Response;
+        let body: ResT;
+        try {
+          if (currentAttempt > 1) {
+            logger.debug(
+              `*** [apiv2] Attempting the request again. Attempt number ${currentAttempt}`,
+            );
+          }
+          this.logRequest(options);
+          try {
+            res = await fetch(fetchURL, fetchOptions);
+          } catch (thrown: any) {
+            const err = thrown instanceof Error ? thrown : new Error(thrown);
+            logger.debug(
+              `*** [apiv2] error from fetch(${fetchURL}, ${JSON.stringify(fetchOptions)}): ${err}`,
+            );
+            const isAbortError = err.name.includes("AbortError");
+            if (isAbortError) {
+              throw new FirebaseError(`Timeout reached making request to ${fetchURL}`, {
+                original: err,
+              });
+            }
+            throw new FirebaseError(`Failed to make request to ${fetchURL}`, { original: err });
+          } finally {
+            // If we succeed or failed, clear the timeout.
+            if (reqTimeout) {
+              clearTimeout(reqTimeout);
+            }
+          }
+
+          if (options.responseType === "json") {
+            const text = await res.text();
+            // Some responses, such as 204 and occasionally 202s don't have
+            // any content. We can't just rely on response code (202 may have conent)
+            // and unfortuantely res.length is unreliable (many requests return zero).
+            if (!text.length) {
+              body = undefined as unknown as ResT;
+            } else {
+              try {
+                body = JSON.parse(text) as ResT;
+              } catch (err: unknown) {
+                // JSON-parse errors are useless. Log the response for better debugging.
+                this.logResponse(res, text, options);
+                throw new FirebaseError(`Unable to parse JSON: ${err}`);
+              }
+            }
+          } else if (options.responseType === "xml") {
+            body = (await res.text()) as unknown as ResT;
+          } else if (options.responseType === "stream") {
+            body = res.body as unknown as ResT;
+          } else {
+            throw new FirebaseError(`Unable to interpret response. Please set responseType.`, {
+              exit: 2,
+            });
+          }
+        } catch (err: unknown) {
+          return err instanceof FirebaseError ? reject(err) : reject(new FirebaseError(`${err}`));
+        }
+
+        this.logResponse(res, body, options);
+
+        if (res.status >= 400) {
+          if (res.status === 401 && this.opts.auth) {
+            // If we get a 401, access token is expired or otherwise invalid.
+            // Throw it away and get a new one. We check for validity before using
+            // tokens, so this should not happen.
+            logger.debug(
+              "Got a 401 Unauthenticated error for a call that required authentication. Refreshing tokens.",
+            );
+            setAccessToken();
+            setAccessToken(await getAccessToken());
+          }
+          if (options.retryCodes?.includes(res.status)) {
+            const err = responseToError({ statusCode: res.status }, body, fetchURL) || undefined;
+            if (operation.retry(err)) {
+              return;
+            }
+          }
+          if (!options.resolveOnHTTPError) {
+            return reject(responseToError({ statusCode: res.status }, body, fetchURL));
+          }
+        }
+
+        resolve({
+          status: res.status,
+          response: res,
+          body,
+        });
+      });
+    });
   }
 
   private logRequest(options: InternalClientRequestOptions<unknown>): void {
@@ -408,6 +508,14 @@ export class Client {
     }
     const logURL = this.requestURL(options);
     logger.debug(`>>> [apiv2][query] ${options.method} ${logURL} ${queryParamsLog}`);
+    const headers = options.headers;
+    if (headers && headers.has(GOOG_QUOTA_USER_HEADER)) {
+      logger.debug(
+        `>>> [apiv2][(partial)header] ${options.method} ${logURL} x-goog-quota-user=${
+          headers.get(GOOG_QUOTA_USER_HEADER) || ""
+        }`,
+      );
+    }
     if (options.body !== undefined) {
       let logBody = "[omitted]";
       if (!options.skipLog?.body) {
@@ -420,7 +528,7 @@ export class Client {
   private logResponse(
     res: Response,
     body: unknown,
-    options: InternalClientRequestOptions<unknown>
+    options: InternalClientRequestOptions<unknown>,
   ): void {
     const logURL = this.requestURL(options);
     logger.debug(`<<< [apiv2][status] ${options.method} ${logURL} ${res.status}`);
@@ -433,7 +541,7 @@ export class Client {
 }
 
 function isLocalInsecureRequest(urlPrefix: string): boolean {
-  const u = parse(urlPrefix);
+  const u = new URL(urlPrefix);
   return u.protocol === "http:";
 }
 
@@ -451,5 +559,5 @@ function bodyToString(body: unknown): string {
 }
 
 function isStream(o: unknown): o is NodeJS.ReadableStream {
-  return o instanceof Readable;
+  return o instanceof Readable || o instanceof FormData;
 }

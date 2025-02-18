@@ -117,24 +117,27 @@ export const V2_FREE_TIER = {
 
 // In v1, CPU is automatically fixed to the memory size determines the CPU size.
 // Table at https://cloud.google.com/functions/pricing#compute_time
+const VCPU_TO_GHZ = 2.4;
 const MB_TO_GHZ = {
   128: 0.2,
   256: 0.4,
   512: 0.8,
   1024: 1.4,
-  2048: 2.4,
-  4096: 4.8,
-  8192: 4.8,
+  2048: 1 * VCPU_TO_GHZ,
+  4096: 2 * VCPU_TO_GHZ,
+  8192: 2 * VCPU_TO_GHZ,
+  16384: 4 * VCPU_TO_GHZ,
+  32768: 8 * VCPU_TO_GHZ,
 };
 
 /** Whether we have information in our price sheet to calculate the minInstance cost. */
 export function canCalculateMinInstanceCost(endpoint: backend.Endpoint): boolean {
-  if (!endpoint.minInstances) {
+  if (endpoint.minInstances === undefined || endpoint.minInstances === null) {
     return true;
   }
 
-  if (endpoint.platform == "gcfv1") {
-    if (!MB_TO_GHZ[endpoint.availableMemoryMb || 256]) {
+  if (endpoint.platform === "gcfv1") {
+    if (!MB_TO_GHZ[endpoint.availableMemoryMb || backend.DEFAULT_MEMORY]) {
       return false;
     }
 
@@ -169,11 +172,11 @@ export function monthlyMinInstanceCost(endpoints: backend.Endpoint[]): number {
   };
 
   for (const endpoint of endpoints) {
-    if (!endpoint.minInstances) {
+    if (endpoint.minInstances === undefined || endpoint.minInstances === null) {
       continue;
     }
 
-    const ramMb = endpoint.availableMemoryMb || 256;
+    const ramMb = endpoint.availableMemoryMb || backend.DEFAULT_MEMORY;
     const ramGb = ramMb / 1024;
     if (endpoint.platform === "gcfv1") {
       const cpu = MB_TO_GHZ[ramMb];
@@ -184,12 +187,12 @@ export function monthlyMinInstanceCost(endpoints: backend.Endpoint[]): number {
         usage["gcfv1"][tier].cpu + cpu * SECONDS_PER_MONTH * endpoint.minInstances;
     } else {
       // V2 is currently fixed at 1vCPU.
-      const cpu = 1;
       const tier = V2_REGION_TO_TIER[endpoint.region];
       usage["gcfv2"][tier].ram =
         usage["gcfv2"][tier].ram + ramGb * SECONDS_PER_MONTH * endpoint.minInstances;
       usage["gcfv2"][tier].cpu =
-        usage["gcfv2"][tier].cpu + cpu * SECONDS_PER_MONTH * endpoint.minInstances;
+        usage["gcfv2"][tier].cpu +
+        (endpoint.cpu as number) * SECONDS_PER_MONTH * endpoint.minInstances;
     }
   }
 

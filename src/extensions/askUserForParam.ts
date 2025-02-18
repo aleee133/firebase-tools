@@ -1,8 +1,8 @@
 import * as _ from "lodash";
-import * as clc from "cli-color";
-import * as marked from "marked";
+import * as clc from "colorette";
+import { marked } from "marked";
 
-import { Param, ParamOption, ParamType } from "./extensionsApi";
+import { Param, ParamOption, ParamType } from "./types";
 import * as secretManagerApi from "../gcp/secretManager";
 import * as secretsUtils from "./secretsUtils";
 import { logPrefix, substituteParams } from "./extensionsHelper";
@@ -10,17 +10,36 @@ import { convertExtensionOptionToLabeledList, getRandomString, onceWithJoin } fr
 import { logger } from "../logger";
 import { promptOnce } from "../prompt";
 import * as utils from "../utils";
+import { ParamBindingOptions } from "./paramHelper";
+import { needProjectId } from "../projectUtils";
+import { partition } from "../functional";
+
+/**
+ * Location where the secret value is stored.
+ *
+ * Visible for testing.
+ */
+export enum SecretLocation {
+  CLOUD = 1,
+  LOCAL,
+}
 
 enum SecretUpdateAction {
-  LEAVE,
+  LEAVE = 1,
   SET_NEW,
 }
 
+/**
+ * Validates the user's response for param value against the param spec
+ * @param response The user's response
+ * @param spec The param spec
+ * @return True if the user's response is valid
+ */
 export function checkResponse(response: string, spec: Param): boolean {
   let valid = true;
   let responses: string[];
 
-  if (spec.required && (response == "" || response == undefined)) {
+  if (spec.required && (response === "" || response === undefined)) {
     utils.logWarning(`Param ${spec.param} is required, but no value was provided.`);
     return false;
   }
@@ -34,7 +53,7 @@ export function checkResponse(response: string, spec: Param): boolean {
   if (spec.validationRegex && !!response) {
     // !!response to ignore empty optional params
     const re = new RegExp(spec.validationRegex);
-    _.forEach(responses, (resp) => {
+    for (const resp of responses) {
       if ((spec.required || resp !== "") && !re.test(resp)) {
         const genericWarn =
           `${resp} is not a valid value for ${spec.param} since it` +
@@ -42,38 +61,117 @@ export function checkResponse(response: string, spec: Param): boolean {
         utils.logWarning(spec.validationErrorMessage || genericWarn);
         valid = false;
       }
-    });
+    }
   }
 
   if (spec.type && (spec.type === ParamType.MULTISELECT || spec.type === ParamType.SELECT)) {
-    _.forEach(responses, (r) => {
+    for (const r of responses) {
       // A choice is valid if it matches one of the option values.
-      const validChoice = _.some(spec.options, (option: ParamOption) => {
-        return r === option.value;
-      });
-      if (!validChoice) {
+      const validChoice = spec.options?.some((option) => r === option.value);
+      if (r && !validChoice) {
         utils.logWarning(`${r} is not a valid option for ${spec.param}.`);
         valid = false;
       }
-    });
+    }
   }
   return valid;
 }
 
-export async function askForParam(
-  projectId: string,
-  instanceId: string,
-  paramSpec: Param,
-  reconfiguring: boolean
-): Promise<string> {
+/**
+ * Prompt users for params based on paramSpecs defined by the extension developer.
+ * @param args.projectId The projectId for the params
+ * @param args.instanceId The instanceId for the params
+ * @param args.paramSpecs Array of params to ask the user about, parsed from extension.yaml.
+ * @param args.firebaseProjectParams Autopopulated Firebase project-specific params
+ * @return Promisified map of env vars to values.
+ */
+export async function ask(args: {
+  projectId: string | undefined;
+  instanceId: string;
+  paramSpecs: Param[];
+  firebaseProjectParams: { [key: string]: string };
+  reconfiguring: boolean;
+}): Promise<{ [key: string]: ParamBindingOptions }> {
+  if (_.isEmpty(args.paramSpecs)) {
+    logger.debug("No params were specified for this extension.");
+    return {};
+  }
+
+  utils.logLabeledBullet(logPrefix, "answer the questions below to configure your extension:");
+  const substituted = substituteParams<Param[]>(args.paramSpecs, args.firebaseProjectParams);
+  const [advancedParams, standardParams] = partition(substituted, (p) => p.advanced ?? false);
+  const result: { [key: string]: ParamBindingOptions } = {};
+  const promises = standardParams.map((paramSpec) => {
+    return async () => {
+      result[paramSpec.param] = await askForParam({
+        projectId: args.projectId,
+        instanceId: args.instanceId,
+        paramSpec: paramSpec,
+        reconfiguring: args.reconfiguring,
+      });
+    };
+  });
+  if (advancedParams.length) {
+    promises.push(async () => {
+      const shouldPrompt = await promptOnce({
+        type: "confirm",
+        message: "Do you want to configure any advanced parameters for this instance?",
+        default: false,
+      });
+      if (shouldPrompt) {
+        const advancedPromises = advancedParams.map((paramSpec) => {
+          return async () => {
+            result[paramSpec.param] = await askForParam({
+              projectId: args.projectId,
+              instanceId: args.instanceId,
+              paramSpec: paramSpec,
+              reconfiguring: args.reconfiguring,
+            });
+          };
+        });
+        await advancedPromises.reduce((prev, cur) => prev.then(cur as any), Promise.resolve());
+      } else {
+        for (const paramSpec of advancedParams) {
+          if (paramSpec.required && paramSpec.default) {
+            result[paramSpec.param] = { baseValue: paramSpec.default };
+          }
+        }
+      }
+    });
+  }
+  // chaining together the promises so they get executed one after another
+  await promises.reduce((prev, cur) => prev.then(cur as any), Promise.resolve());
+
+  logger.info();
+  return result;
+}
+
+/**
+ * Asks the user for values for the extension parameter.
+ * @param args.projectId The projectId we are installing into
+ * @param args.instanceId The instanceId we are creating/updating/configuring
+ * @param args.paramSpec The spec for the param we are asking about
+ * @param args.reconfiguring If true we will reconfigure a secret
+ * @return ParamBindingOptions to specify the selected value(s) for the parameter.
+ */
+export async function askForParam(args: {
+  projectId?: string;
+  instanceId: string;
+  paramSpec: Param;
+  reconfiguring: boolean;
+}): Promise<ParamBindingOptions> {
+  const paramSpec = args.paramSpec;
+
   let valid = false;
   let response = "";
+  let responseForLocal;
+  let secretLocations: string[] = [];
   const description = paramSpec.description || "";
   const label = paramSpec.label.trim();
   logger.info(
-    `\n${clc.bold(label)}${clc.bold(paramSpec.required ? "" : " (Optional)")}: ${marked(
-      description
-    ).trim()}`
+    `\n${clc.bold(label)}${clc.bold(paramSpec.required ? "" : " (Optional)")}: ${(
+      await marked(description)
+    ).trim()}`,
   );
 
   while (!valid) {
@@ -109,16 +207,26 @@ export async function askForParam(
           },
           message:
             "Which options do you want enabled for this parameter? " +
-            "Press Space to select, then Enter to confirm your choices. " +
-            "You may select multiple options.",
+            "Press Space to select, then Enter to confirm your choices. ",
           choices: convertExtensionOptionToLabeledList(paramSpec.options as ParamOption[]),
         });
         valid = checkResponse(response, paramSpec);
         break;
       case ParamType.SECRET:
-        response = reconfiguring
-          ? await promptReconfigureSecret(projectId, instanceId, paramSpec)
-          : await promptCreateSecret(projectId, instanceId, paramSpec);
+        do {
+          secretLocations = await promptSecretLocations(paramSpec);
+        } while (!isValidSecretLocations(secretLocations, paramSpec));
+
+        if (secretLocations.includes(SecretLocation.CLOUD.toString())) {
+          // TODO(lihes): evaluate the UX of this error message.
+          const projectId = needProjectId({ projectId: args.projectId });
+          response = args.reconfiguring
+            ? await promptReconfigureSecret(projectId, args.instanceId, paramSpec)
+            : await promptCreateSecret(projectId, args.instanceId, paramSpec);
+        }
+        if (secretLocations.includes(SecretLocation.LOCAL.toString())) {
+          responseForLocal = await promptLocalSecret(args.instanceId, paramSpec);
+        }
         valid = true;
         break;
       default:
@@ -132,13 +240,78 @@ export async function askForParam(
         valid = checkResponse(response, paramSpec);
     }
   }
-  return response;
+  return { baseValue: response, ...(responseForLocal ? { local: responseForLocal } : {}) };
+}
+
+function isValidSecretLocations(secretLocations: string[], paramSpec: Param): boolean {
+  if (paramSpec.required) {
+    return !!secretLocations.length;
+  }
+  return true;
+}
+
+async function promptSecretLocations(paramSpec: Param): Promise<string[]> {
+  if (paramSpec.required) {
+    return await promptOnce({
+      name: "input",
+      type: "checkbox",
+      message: "Where would you like to store your secrets? You must select at least one value",
+      choices: [
+        {
+          checked: true,
+          name: "Google Cloud Secret Manager (Used by deployed extensions and emulator)",
+          // return type of string is not actually enforced, need to manually convert.
+          value: SecretLocation.CLOUD.toString(),
+        },
+        {
+          checked: false,
+          name: "Local file (Used by emulator only)",
+          value: SecretLocation.LOCAL.toString(),
+        },
+      ],
+    });
+  }
+  return await promptOnce({
+    name: "input",
+    type: "checkbox",
+    message:
+      "Where would you like to store your secrets? " +
+      "If you don't want to set this optional secret, leave both options unselected to skip it",
+    choices: [
+      {
+        checked: false,
+        name: "Google Cloud Secret Manager (Used by deployed extensions and emulator)",
+        // return type of string is not actually enforced, need to manually convert.
+        value: SecretLocation.CLOUD.toString(),
+      },
+      {
+        checked: false,
+        name: "Local file (Used by emulator only)",
+        value: SecretLocation.LOCAL.toString(),
+      },
+    ],
+  });
+}
+
+async function promptLocalSecret(instanceId: string, paramSpec: Param): Promise<string> {
+  let value;
+  do {
+    utils.logLabeledBullet(logPrefix, "Configure a local secret value for Extensions Emulator");
+    value = await promptOnce({
+      name: paramSpec.param,
+      type: "input",
+      message:
+        `This secret will be stored in ./extensions/${instanceId}.secret.local.\n` +
+        `Enter value for "${paramSpec.label.trim()}" to be used by Extensions Emulator:`,
+    });
+  } while (!value);
+  return value;
 }
 
 async function promptReconfigureSecret(
   projectId: string,
   instanceId: string,
-  paramSpec: Param
+  paramSpec: Param,
 ): Promise<string> {
   const action = await promptOnce({
     type: "list",
@@ -149,7 +322,7 @@ async function promptReconfigureSecret(
     ],
   });
   switch (action) {
-    case SecretUpdateAction.SET_NEW:
+    case SecretUpdateAction.SET_NEW: {
       let secret;
       let secretName;
       if (paramSpec.default) {
@@ -172,7 +345,7 @@ async function promptReconfigureSecret(
             secret = await secretManagerApi.createSecret(
               projectId,
               secretName,
-              secretsUtils.getSecretLabels(instanceId)
+              secretsUtils.getSecretLabels(instanceId),
             );
           }
           return addNewSecretVersion(projectId, instanceId, secret, paramSpec, secretValue);
@@ -182,17 +355,26 @@ async function promptReconfigureSecret(
       } else {
         return "";
       }
+    }
     case SecretUpdateAction.LEAVE:
     default:
       return paramSpec.default || "";
   }
 }
 
+/**
+ * Prompts the user to create a secret
+ * @param projectId The projectId to create the secret in
+ * @param instanceId The instanceId for the secret
+ * @param paramSpec The secret param spec
+ * @param secretName (Optional) The name to store the secret as
+ * @return The resource name of a new secret version or empty string if no secret is created.
+ */
 export async function promptCreateSecret(
   projectId: string,
   instanceId: string,
   paramSpec: Param,
-  secretName?: string
+  secretName?: string,
 ): Promise<string> {
   const name = secretName ?? (await generateSecretName(projectId, instanceId, paramSpec.param));
   const secretValue = await promptOnce({
@@ -209,7 +391,7 @@ export async function promptCreateSecret(
       const secret = await secretManagerApi.createSecret(
         projectId,
         name,
-        secretsUtils.getSecretLabels(instanceId)
+        secretsUtils.getSecretLabels(instanceId),
       );
       return addNewSecretVersion(projectId, instanceId, secret, paramSpec, secretValue);
     } else {
@@ -223,7 +405,7 @@ export async function promptCreateSecret(
 async function generateSecretName(
   projectId: string,
   instanceId: string,
-  paramName: string
+  paramName: string,
 ): Promise<string> {
   let secretName = `ext-${instanceId}-${paramName}`;
   while (await secretManagerApi.secretExists(projectId, secretName)) {
@@ -237,48 +419,20 @@ async function addNewSecretVersion(
   instanceId: string,
   secret: secretManagerApi.Secret,
   paramSpec: Param,
-  secretValue: string
-) {
-  const version = await secretManagerApi.addVersion(secret, secretValue);
+  secretValue: string,
+): Promise<string> {
+  const version = await secretManagerApi.addVersion(projectId, secret.name, secretValue);
   await secretsUtils.grantFirexServiceAgentSecretAdminRole(secret);
   return `projects/${version.secret.projectId}/secrets/${version.secret.name}/versions/${version.versionId}`;
 }
 
-export function getInquirerDefault(options: ParamOption[], def: string): string {
-  const defaultOption = _.find(options, (option) => {
-    return option.value === def;
-  });
-  return defaultOption ? defaultOption.label || defaultOption.value : "";
-}
-
 /**
- * Prompt users for params based on paramSpecs defined by the extension developer.
- * @param paramSpecs Array of params to ask the user about, parsed from extension.yaml.
- * @param firebaseProjectParams Autopopulated Firebase project-specific params
- * @return Promisified map of env vars to values.
+ * Finds the label or value of a default option if the option is found in options
+ * @param options The param options to search for default
+ * @param def The value of the default to search for
+ * @return The label or value of the default if present or empty string if not.
  */
-export async function ask(
-  projectId: string,
-  instanceId: string,
-  paramSpecs: Param[],
-  firebaseProjectParams: { [key: string]: string },
-  reconfiguring: boolean
-): Promise<{ [key: string]: string }> {
-  if (_.isEmpty(paramSpecs)) {
-    logger.debug("No params were specified for this extension.");
-    return {};
-  }
-
-  utils.logLabeledBullet(logPrefix, "answer the questions below to configure your extension:");
-  const substituted = substituteParams<Param[]>(paramSpecs, firebaseProjectParams);
-  const result: any = {};
-  const promises = _.map(substituted, (paramSpec: Param) => {
-    return async () => {
-      result[paramSpec.param] = await askForParam(projectId, instanceId, paramSpec, reconfiguring);
-    };
-  });
-  // chaining together the promises so they get executed one after another
-  await promises.reduce((prev, cur) => prev.then(cur as any), Promise.resolve());
-  logger.info();
-  return result;
+export function getInquirerDefault(options: ParamOption[], def: string): string {
+  const defaultOption = options.find((o) => o.value === def);
+  return defaultOption ? defaultOption.label || defaultOption.value : "";
 }

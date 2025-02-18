@@ -8,15 +8,15 @@ import { getVersions } from "../remoteconfig/versionslist";
 
 import { needProjectId } from "../projectUtils";
 
-module.exports = new Command("remoteconfig:rollback")
+export const command = new Command("remoteconfig:rollback")
   .description(
-    "roll back a project's published Remote Config template to the one specified by the provided version number"
+    "roll back a project's published Remote Config template to the one specified by the provided version number",
   )
   .before(requireAuth)
   .before(requirePermissions, ["cloudconfig.configs.get", "cloudconfig.configs.update"])
   .option(
     "-v, --version-number <versionNumber>",
-    "rollback to the specified version of the template"
+    "rollback to the specified version of the template",
   )
   .withForce()
   .action(async (options) => {
@@ -36,7 +36,7 @@ module.exports = new Command("remoteconfig:rollback")
         `Failed to rollback Firebase Remote Config template for project to version` +
           targetVersion +
           `. ` +
-          `Invalid Version Number`
+          `Invalid Version Number`,
       );
     }
     const confirm = await promptOnce(
@@ -46,7 +46,7 @@ module.exports = new Command("remoteconfig:rollback")
         message: "Proceed to rollback template to version " + targetVersion + "?",
         default: false,
       },
-      options
+      options,
     );
     if (!confirm) {
       return;

@@ -1,6 +1,6 @@
 import { size } from "lodash";
 import AbortController from "abort-controller";
-import * as clc from "cli-color";
+import * as clc from "colorette";
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -9,7 +9,7 @@ import * as zlib from "zlib";
 import { Client } from "../../apiv2";
 import { Queue } from "../../throttler/queue";
 import { hostingApiOrigin } from "../../api";
-import * as hashcache from "./hashcache";
+import { load, dump, HashRecord } from "./hashcache";
 import { logger } from "../../logger";
 import { FirebaseError } from "../../error";
 
@@ -19,7 +19,7 @@ const MAX_UPLOAD_TIMEOUT = 7200000; // 2h
 function progressMessage(message: string, current: number, total: number): string {
   current = Math.min(current, total);
   const percent = Math.floor(((current * 1.0) / total) * 100).toString();
-  return `${message} [${current}/${total}] (${clc.bold.green(`${percent}%`)})`;
+  return `${message} [${current}/${total}] (${clc.bold(clc.green(`${percent}%`))})`;
 }
 
 export class Uploader {
@@ -27,28 +27,24 @@ export class Uploader {
   private cwd: string;
   private projectRoot: string;
   private gzipLevel: number;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private hashQueue: Queue<any, unknown>;
+  private hashQueue: Queue<string, void>;
   private populateBatchSize: number;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private populateBatch: any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private populateQueue: Queue<any, unknown>;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private uploadQueue: Queue<any, unknown>;
+  private populateBatch: Record<string, string>;
+  private populateQueue: Queue<Record<string, string>, void>;
+  private uploadQueue: Queue<string, void>;
   private public: string;
   private files: string[];
   private fileCount: number;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private cache: { [key: string]: any };
-  private cacheNew: Map<unknown, unknown>;
+  private cache: Map<string, HashRecord>;
+  private cacheNew: Map<string, HashRecord>;
   private sizeMap: { [key: string]: number };
   private hashMap: { [key: string]: string };
   private pathMap: { [key: string]: string };
   private uploadUrl: string | undefined;
   private uploadClient: Client | undefined;
   private hashClient = new Client({
-    urlPrefix: hostingApiOrigin,
+    urlPrefix: hostingApiOrigin(),
     auth: true,
     apiVersion: "v1beta1",
   });
@@ -83,7 +79,7 @@ export class Uploader {
     this.files = options.files;
     this.fileCount = this.files.length;
 
-    this.cache = hashcache.load(this.projectRoot, this.hashcacheName());
+    this.cache = load(this.projectRoot, this.hashcacheName());
     this.cacheNew = new Map();
 
     this.sizeMap = {};
@@ -112,7 +108,7 @@ export class Uploader {
       .wait()
       .then(this.queuePopulate.bind(this))
       .then(() => {
-        hashcache.dump(this.projectRoot, this.hashcacheName(), this.cacheNew);
+        dump(this.projectRoot, this.hashcacheName(), this.cacheNew);
         logger.debug("[hosting][hash queue][FINAL]", this.hashQueue.stats());
         this.populateQueue.close();
         return this.populateQueue.wait();
@@ -126,9 +122,9 @@ export class Uploader {
     this.uploadQueue.wait().catch((err: Error) => {
       if (err.message.includes("content hash")) {
         logger.debug(
-          "[hosting][upload queue] upload failed with content hash error. Deleting hash cache"
+          "[hosting][upload queue] upload failed with content hash error. Deleting hash cache",
         );
-        hashcache.dump(this.projectRoot, this.hashcacheName(), new Map());
+        dump(this.projectRoot, this.hashcacheName(), new Map());
       }
     });
 
@@ -153,13 +149,13 @@ export class Uploader {
       return progressMessage(
         "adding files to version",
         this.populateQueue.complete * 1000,
-        this.fileCount
+        this.fileCount,
       );
     } else if (!this.uploadQueue.finished) {
       return progressMessage(
         "uploading new files",
         this.uploadQueue.complete,
-        this.uploadQueue.stats().total
+        this.uploadQueue.stats().total,
       );
     } else {
       return "upload complete";
@@ -170,7 +166,7 @@ export class Uploader {
     const stats = fs.statSync(path.resolve(this.public, filePath));
     const mtime = stats.mtime.getTime();
     this.sizeMap[filePath] = stats.size;
-    const cached = this.cache[filePath];
+    const cached = this.cache.get(filePath);
     if (cached && cached.mtime === mtime) {
       this.cacheNew.set(filePath, cached);
       this.addHash(filePath, cached.hash);
@@ -211,8 +207,7 @@ export class Uploader {
     this.populateQueue.process();
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async populateHandler(batch: any): Promise<void> {
+  async populateHandler(batch: Record<string, string>): Promise<void> {
     // wait for any existing populate calls to finish before proceeding
     const res = await this.hashClient.post<
       unknown,
@@ -255,7 +250,7 @@ export class Uploader {
       logger.debug(
         `[hosting][upload] ${this.hashMap[toUpload]} (${toUpload}) HTTP ERROR ${
           res.status
-        }: headers=${JSON.stringify(res.response.headers)} ${errorMessage}`
+        }: headers=${JSON.stringify(res.response.headers)} ${errorMessage}`,
       );
       throw new Error(`Unexpected error while uploading file: ${errorMessage}`);
     }

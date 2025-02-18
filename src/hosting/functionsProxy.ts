@@ -6,6 +6,8 @@ import { needProjectId } from "../projectUtils";
 import { EmulatorRegistry } from "../emulator/registry";
 import { Emulators } from "../emulator/types";
 import { FunctionsEmulator } from "../emulator/functionsEmulator";
+import { HostingRewrites, LegacyFunctionsRewrite } from "../firebaseConfig";
+import { FirebaseError } from "../error";
 
 export interface FunctionsProxyOptions {
   port: number;
@@ -13,24 +15,32 @@ export interface FunctionsProxyOptions {
   targets: string[];
 }
 
-export interface FunctionProxyRewrite {
-  function: string;
-}
-
 /**
  * Returns a function which, given a FunctionProxyRewrite, returns a Promise
  * that resolves with a middleware-like function that proxies the request to a
  * hosted or live function.
  */
-export default function (
-  options: FunctionsProxyOptions
-): (r: FunctionProxyRewrite) => Promise<RequestHandler> {
-  return (rewrite: FunctionProxyRewrite) => {
+export function functionsProxy(
+  options: FunctionsProxyOptions,
+): (r: HostingRewrites) => Promise<RequestHandler> {
+  return (rewrite: HostingRewrites) => {
     return new Promise((resolve) => {
-      // TODO(samstern): This proxy assumes all functions are in the default region, but this is
-      //                 not a safe assumption.
       const projectId = needProjectId(options);
-      let url = `https://us-central1-${projectId}.cloudfunctions.net/${rewrite.function}`;
+      if (!("function" in rewrite)) {
+        throw new FirebaseError(`A non-function rewrite cannot be used in functionsProxy`, {
+          exit: 2,
+        });
+      }
+      let functionId: string;
+      let region: string;
+      if (typeof rewrite.function === "string") {
+        functionId = rewrite.function;
+        region = (rewrite as LegacyFunctionsRewrite).region || "us-central1";
+      } else {
+        functionId = rewrite.function.functionId;
+        region = rewrite.function.region || "us-central1";
+      }
+      let url = `https://${region}-${projectId}.cloudfunctions.net/${functionId}`;
       let destLabel = "live";
 
       if (includes(options.targets, "functions")) {
@@ -38,19 +48,12 @@ export default function (
 
         // If the functions emulator is running we know the port, otherwise
         // things still point to production.
-        const functionsEmu = EmulatorRegistry.get(Emulators.FUNCTIONS);
-        if (functionsEmu) {
-          url = FunctionsEmulator.getHttpFunctionUrl(
-            functionsEmu.getInfo().host,
-            functionsEmu.getInfo().port,
-            projectId,
-            rewrite.function,
-            "us-central1"
-          );
+        if (EmulatorRegistry.isRunning(Emulators.FUNCTIONS)) {
+          url = FunctionsEmulator.getHttpFunctionUrl(projectId, functionId, region);
         }
       }
 
-      resolve(proxyRequestHandler(url, `${destLabel} Function ${rewrite.function}`));
+      resolve(proxyRequestHandler(url, `${destLabel} Function ${region}/${functionId}`));
     });
   };
 }

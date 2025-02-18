@@ -2,7 +2,7 @@
 set -e
 
 printusage() {
-  echo "run.sh <version>"
+  echo "run.sh <version> <vscode_version>"
   echo ""
   echo "Arguments:"
   echo "  version: 'patch', 'minor', or 'major'."
@@ -24,5 +24,6 @@ cd "$THIS_DIR"
 gcloud --project fir-tools-builds \
   builds \
   submit \
+  --machine-type=e2-highcpu-8 \
   --substitutions=_VERSION=$VERSION \
   .
